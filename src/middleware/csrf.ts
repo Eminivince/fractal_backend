@@ -20,10 +20,12 @@ export function registerCsrfRoutes(app: FastifyInstance) {
   // Endpoint to get a CSRF token
   app.get("/v1/auth/csrf-token", async (_request: FastifyRequest, reply: FastifyReply) => {
     const token = generateCsrfToken();
+    const isProd = process.env.NODE_ENV === "production";
     reply.setCookie(CSRF_COOKIE, token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "strict",
+      secure: isProd,
+      // Allow cross-site API calls from the web app in production.
+      sameSite: isProd ? "none" : "lax",
       path: "/",
       maxAge: 8 * 60 * 60,
     });
