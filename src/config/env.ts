@@ -171,4 +171,6 @@ if (!parsed.success) {
   throw new Error("Invalid environment configuration");
 }
 
+console.log(parsed.data);
+
 export const env = parsed.data;
