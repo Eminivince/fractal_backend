@@ -1,40 +1,32 @@
-# A-87: Dockerfile for the Fractal API service
-# Build: docker build -t fractal-api -f apps/api/Dockerfile .
+# Dockerfile for the Fractal API service.
+# Build: docker build -t fractal-api .
 # Run:   docker run -p 4000:4000 --env-file .env fractal-api
 
 FROM node:24-alpine AS base
 WORKDIR /app
 
-# Use the workspace-pinned package manager for reproducible image builds.
 RUN corepack enable && corepack prepare pnpm@9.15.4 --activate
 
-# ── Dependencies ──────────────────────────────────────────────────────────────
 FROM base AS deps
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY apps/api/package.json ./apps/api/
-RUN pnpm --filter @fractal/api... install --frozen-lockfile
+COPY package.json ./
+RUN pnpm install --no-frozen-lockfile
 
-# ── Build ─────────────────────────────────────────────────────────────────────
 FROM deps AS builder
-COPY apps/api ./apps/api
 COPY tsconfig*.json ./
-WORKDIR /app/apps/api
+COPY src ./src
+COPY scripts ./scripts
 RUN pnpm run build
+RUN pnpm prune --prod
 
-# ── Production image ──────────────────────────────────────────────────────────
 FROM node:24-alpine AS runner
 WORKDIR /app
 
-# Security: run as non-root user
 RUN addgroup --system --gid 1001 fractal && \
     adduser --system --uid 1001 fractal
 
-COPY --from=builder --chown=fractal:fractal /app/apps/api/dist ./dist
-# `dist/*.js` is ESM. Preserve the package boundary/type at the flattened
-# runtime root so Node does not reinterpret the server as CommonJS.
-COPY --from=builder --chown=fractal:fractal /app/apps/api/package.json ./package.json
-COPY --from=deps --chown=fractal:fractal /app/node_modules ./node_modules
-COPY --from=deps --chown=fractal:fractal /app/apps/api/node_modules ./apps/api/node_modules
+COPY --from=builder --chown=fractal:fractal /app/dist ./dist
+COPY --from=builder --chown=fractal:fractal /app/package.json ./package.json
+COPY --from=builder --chown=fractal:fractal /app/node_modules ./node_modules
 
 USER fractal
 
