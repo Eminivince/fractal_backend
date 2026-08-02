@@ -453,7 +453,7 @@ const schema = z.object({
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["FILE_STORAGE_PROVIDER"],
-        message: "FILE_STORAGE_PROVIDER must be s3 in production; local and public-media storage are not permitted for regulated documents.",
+        message: "FILE_STORAGE_PROVIDER must be s3 in production. Use NODE_ENV=development for staging if you use Cloudinary. Local and public-media storage are not permitted for regulated private documents in production.",
       });
     }
     if (cfg.FILE_STORAGE_FALLBACK_TO_LOCAL) {
