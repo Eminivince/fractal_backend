@@ -36,6 +36,15 @@ function isSecurePublicAppBaseUrl(value: string | undefined): boolean {
   }
 }
 
+function isCloudflareR2Endpoint(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    return new URL(value).hostname.toLowerCase().endsWith(".r2.cloudflarestorage.com");
+  } catch {
+    return false;
+  }
+}
+
 const schema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
@@ -466,7 +475,13 @@ const schema = z.object({
     require("S3_BUCKET", "private S3 document bucket");
     require("S3_ACCESS_KEY_ID", "S3 document-storage credential");
     require("S3_SECRET_ACCESS_KEY", "S3 document-storage credential");
-    require("S3_KMS_KEY_ID", "customer-managed KMS key for private S3 objects");
+    if (!cfg.S3_KMS_KEY_ID && !isCloudflareR2Endpoint(cfg.S3_ENDPOINT)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["S3_KMS_KEY_ID"],
+        message: "S3_KMS_KEY_ID is required for AWS S3 production storage. Leave it empty only when S3_ENDPOINT is a Cloudflare R2 endpoint, because R2 encrypts objects at rest with provider-managed AES-256.",
+      });
+    }
     if (!cfg.MALWARE_SCAN_REQUIRED) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
