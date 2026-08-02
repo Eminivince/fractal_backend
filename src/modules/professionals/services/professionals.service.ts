@@ -174,6 +174,17 @@ export async function updateProfessional(
   const professional = await ProfessionalModel.findById(professionalId);
   if (!professional) throw new HttpError(404, "Professional not found");
 
+  // Scope: a professional may only edit THEIR OWN profile, and may NOT change
+  // their own review status / onboarding decision (operator/admin only).
+  if (authUser.role === "professional") {
+    const acting = await UserModel.findById(authUser.userId).select("professionalId").lean();
+    if (!acting?.professionalId || String(acting.professionalId) !== String(professionalId)) {
+      throw new HttpError(403, "Professional out of scope");
+    }
+    delete (payload as { status?: unknown }).status;
+    delete (payload as { onboardingStatus?: unknown }).onboardingStatus;
+  }
+
   applyProfessionalPayload(professional, payload);
   if (payload.status) professional.status = payload.status;
   if (payload.onboardingStatus) professional.onboardingStatus = payload.onboardingStatus;
@@ -262,11 +273,15 @@ export async function registerProfessionalProfile(
     action: "Professional onboarding profile saved",
   });
 
-  const token = await app.jwt.sign({
-    userId: user._id.toString(),
-    role: user.role,
-    professionalId: String(professional._id),
-  });
+  // 3.7: explicit expiry so the issued session token cannot live forever.
+  const token = await app.jwt.sign(
+    {
+      userId: user._id.toString(),
+      role: user.role,
+      professionalId: String(professional._id),
+    },
+    { expiresIn: "8h" },
+  );
 
   return {
     token,

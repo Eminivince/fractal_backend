@@ -1,6 +1,7 @@
 import { HttpError } from "./errors.js";
 import type {
   ApplicationStatus,
+  DistributionLineStatus,
   DistributionStatus,
   MilestoneStatus,
   OfferingStatus,
@@ -38,12 +39,17 @@ interface DistributionContext {
   trusteeProcessCompleted?: boolean;
 }
 
+interface DistributionLineContext {
+  hasOutboundTransfer?: boolean;
+}
+
 interface MilestoneContext {
   hasEvidence?: boolean;
 }
 
 interface TrancheContext {
   hasPayoutReceipts?: boolean;
+  hasOutboundTransfer?: boolean;
   trusteeProcessCompleted?: boolean;
 }
 
@@ -73,8 +79,9 @@ const subscriptionTransitions: Record<SubscriptionStatus, SubscriptionStatus[]> 
   draft: ["committed", "cancelled"],
   committed: ["payment_pending", "cancelled"],
   payment_pending: ["paid", "cancelled"],
-  paid: ["allocation_confirmed", "refunded"],
-  allocation_confirmed: ["refunded"],
+  paid: ["allocation_confirmed", "refund_pending", "refunded"],
+  allocation_confirmed: ["refund_pending", "refunded"],
+  refund_pending: ["refunded", "paid"],
   cancelled: [],
   refunded: [],
 };
@@ -83,7 +90,11 @@ const distributionTransitions: Record<DistributionStatus, DistributionStatus[]> 
   draft: ["pending_approval"],
   pending_approval: ["approved"],
   approved: ["scheduled"],
-  scheduled: ["paid", "failed"],
+  // 3.4: mark-paid atomically claims scheduled -> paying. Settlement (webhook/sweep)
+  // moves paying -> paid/failed once all lines settle. Manual (non-Paystack) mode
+  // moves paying -> paid within the same handler.
+  scheduled: ["paying", "failed"],
+  paying: ["paid", "failed"],
   paid: ["reversed"],
   failed: [],
   reversed: [],
@@ -99,9 +110,19 @@ const milestoneTransitions: Record<MilestoneStatus, MilestoneStatus[]> = {
 
 const trancheTransitions: Record<TrancheStatus, TrancheStatus[]> = {
   locked: ["eligible"],
-  eligible: ["released"],
+  eligible: ["processing", "released"],
+  processing: ["released", "failed"],
   released: ["failed", "reversed"],
   failed: [],
+  reversed: [],
+};
+
+const distributionLineTransitions: Record<DistributionLineStatus, DistributionLineStatus[]> = {
+  pending: ["processing", "paid", "failed", "skipped"],
+  processing: ["paid", "failed"],
+  paid: ["reversed"],
+  failed: ["pending"],
+  skipped: [],
   reversed: [],
 };
 
@@ -146,6 +167,12 @@ export function assertTransition(
   context?: TrancheContext,
 ): void;
 export function assertTransition(
+  entityType: "distributionLine",
+  fromStatus: DistributionLineStatus,
+  toStatus: DistributionLineStatus,
+  context?: DistributionLineContext,
+): void;
+export function assertTransition(
   entityType: string,
   fromStatus: string,
   toStatus: string,
@@ -155,7 +182,8 @@ export function assertTransition(
     | SubscriptionContext
     | DistributionContext
     | MilestoneContext
-    | TrancheContext,
+    | TrancheContext
+    | DistributionLineContext,
 ) {
   if (entityType === "application") {
     const applicationContext = context as ApplicationContext | undefined;
@@ -238,7 +266,11 @@ export function assertTransition(
       invalidTransition(entityType, fromStatus, toStatus);
     }
 
-    if (fromStatus === "scheduled" && toStatus === "paid" && !distributionContext?.hasPayoutReceipts) {
+    if (
+      (fromStatus === "scheduled" || fromStatus === "paying") &&
+      toStatus === "paid" &&
+      !distributionContext?.hasPayoutReceipts
+    ) {
       throw new HttpError(422, "Cannot mark distribution paid: payout receipts required");
     }
 
@@ -266,12 +298,32 @@ export function assertTransition(
       invalidTransition(entityType, fromStatus, toStatus);
     }
 
-    if (fromStatus === "eligible" && toStatus === "released" && !trancheContext?.hasPayoutReceipts) {
+    if (fromStatus === "eligible" && toStatus === "processing" && !trancheContext?.hasOutboundTransfer) {
+      throw new HttpError(422, "Cannot process tranche: outbound transfer not created");
+    }
+
+    if (
+      (fromStatus === "eligible" || fromStatus === "processing") &&
+      toStatus === "released" &&
+      !trancheContext?.hasPayoutReceipts
+    ) {
       throw new HttpError(422, "Cannot release tranche without payout receipts");
     }
 
     if (fromStatus === "released" && toStatus === "reversed" && !trancheContext?.trusteeProcessCompleted) {
       throw new HttpError(422, "Cannot reverse tranche: trustee process not completed");
+    }
+    return;
+  }
+
+  if (entityType === "distributionLine") {
+    const dlContext = context as DistributionLineContext | undefined;
+    if (!distributionLineTransitions[fromStatus as DistributionLineStatus]?.includes(toStatus as DistributionLineStatus)) {
+      invalidTransition(entityType, fromStatus, toStatus);
+    }
+
+    if (fromStatus === "pending" && toStatus === "processing" && !dlContext?.hasOutboundTransfer) {
+      throw new HttpError(422, "Cannot process distribution line: outbound transfer not created");
     }
     return;
   }

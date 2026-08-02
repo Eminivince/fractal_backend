@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "privacy-resend-probe-job-v2",
+  "probeReference": "REPLACE-WITH-APPROVED-PROBE-REFERENCE",
+  "identityId": "00000000-0000-4000-8000-000000000000",
+  "policyBinding": {
+    "configurationKey": "privacy.external_source.adapter_policy",
+    "versionId": "00000000-0000-4000-8000-000000000000",
+    "versionNumber": 1,
+    "projectionVersion": 1,
+    "valueSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "implementation": {
+    "adapterKey": "fractal.external.resend.delivery",
+    "version": "1.0.0",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "releaseSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "coverage": {
+    "inventoryVersion": "privacy-external-coverage-v1",
+    "componentKeys": [
+      "authentication_delivery",
+      "support_notification_delivery",
+      "accepted_invitation_delivery"
+    ]
+  },
+  "provider": {
+    "environment": "production",
+    "accountReference": "REPLACE-WITH-APPROVED-RESEND-ACCOUNT-REFERENCE",
+    "regionReference": "REPLACE-WITH-APPROVED-RESIDENCY-REGISTER-REFERENCE"
+  },
+  "execution": {
+    "timeoutMs": 10000,
+    "maximumRecords": 10000,
+    "maximumBytes": 1048576,
+    "evidenceMaximumAgeSeconds": 3600
+  },
+  "governedEvidence": {
+    "portability": "0000000000000000000000000000000000000000000000000000000000000000",
+    "correction": "0000000000000000000000000000000000000000000000000000000000000000",
+    "erasure": "0000000000000000000000000000000000000000000000000000000000000000",
+    "restriction": "0000000000000000000000000000000000000000000000000000000000000000",
+    "objection": "0000000000000000000000000000000000000000000000000000000000000000",
+    "residency": "0000000000000000000000000000000000000000000000000000000000000000",
+    "retention": "0000000000000000000000000000000000000000000000000000000000000000",
+    "deletion": "0000000000000000000000000000000000000000000000000000000000000000",
+    "security": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "signer": {
+    "keyId": "REPLACE_WITH_APPROVED_KEY_ID",
+    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nREPLACE-WITH-ED25519-PUBLIC-KEY\n-----END PUBLIC KEY-----"
+  }
+}

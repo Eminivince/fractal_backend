@@ -1,9 +1,14 @@
 import mongoose from "mongoose";
 import {
+  DistributionLineModel,
   EscrowReceiptModel,
   LedgerEntryModel,
+  OutboundTransferModel,
+  PaymentIntentModel,
   ReconciliationIssueModel,
   ReconciliationRunModel,
+  SubscriptionModel,
+  TrancheModel,
 } from "../db/models.js";
 import { env } from "../config/env.js";
 import { toDecimal } from "../utils/decimal.js";
@@ -131,6 +136,70 @@ export async function runReconciliation(source: "manual" | "bank" | "onchain" | 
           entityId: first?.entityId,
           actualAmount: first?.amount,
           message: "Escrow ledger entry references an external receipt that was not found",
+        });
+      }
+
+      // --- Outbound transfer reconciliation ---
+      // Check: every "success" OutboundTransfer should have a corresponding "paid" entity
+      const successTransfers = await OutboundTransferModel.find({ status: "success" }).session(session).lean();
+      for (const transfer of successTransfers) {
+        if (transfer.entityType === "distribution_line") {
+          const line = await DistributionLineModel.findById(transfer.entityId).session(session).lean();
+          if (line && line.status !== "paid") {
+            issueDocs.push({
+              runId: run._id,
+              issueType: "transfer_entity_mismatch",
+              externalRef: transfer.transferCode,
+              entityType: "distribution_line",
+              entityId: transfer.entityId,
+              actualAmount: toDecimal(transfer.amountKobo / 100),
+              message: `OutboundTransfer is "success" but DistributionLine is "${line.status}"`,
+            });
+          }
+        } else if (transfer.entityType === "refund") {
+          const sub = await SubscriptionModel.findById(transfer.entityId).session(session).lean();
+          if (sub && sub.status !== "refunded") {
+            issueDocs.push({
+              runId: run._id,
+              issueType: "transfer_entity_mismatch",
+              externalRef: transfer.transferCode,
+              entityType: "subscription",
+              entityId: transfer.entityId,
+              actualAmount: toDecimal(transfer.amountKobo / 100),
+              message: `Refund OutboundTransfer is "success" but Subscription is "${sub.status}"`,
+            });
+          }
+        } else if (transfer.entityType === "tranche_release") {
+          const tranche = await TrancheModel.findById(transfer.entityId).session(session).lean();
+          if (tranche && tranche.status !== "released") {
+            issueDocs.push({
+              runId: run._id,
+              issueType: "transfer_entity_mismatch",
+              externalRef: transfer.transferCode,
+              entityType: "tranche",
+              entityId: transfer.entityId,
+              actualAmount: toDecimal(transfer.amountKobo / 100),
+              message: `Tranche OutboundTransfer is "success" but Tranche is "${tranche.status}"`,
+            });
+          }
+        }
+      }
+
+      // Check: stale amount_mismatch PaymentIntents > 24h unresolved
+      const staleMismatches = await PaymentIntentModel.find({
+        status: "amount_mismatch",
+        updatedAt: { $lt: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+      }).session(session).lean();
+      for (const intent of staleMismatches) {
+        issueDocs.push({
+          runId: run._id,
+          issueType: "stale_amount_mismatch",
+          externalRef: intent.paystackReference,
+          entityType: "subscription",
+          entityId: String(intent.subscriptionId),
+          expectedAmount: toDecimal(intent.expectedAmountKobo / 100),
+          actualAmount: intent.receivedAmountKobo ? toDecimal(intent.receivedAmountKobo / 100) : undefined,
+          message: `PaymentIntent amount_mismatch unresolved for > 24h. Expected: ${intent.expectedAmountKobo} kobo, Received: ${intent.receivedAmountKobo ?? "?"} kobo`,
         });
       }
 

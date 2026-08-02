@@ -10,6 +10,7 @@ export async function registerRequestLogger(app: FastifyInstance): Promise<void>
       method: request.method,
       url: request.url,
       userId,
+      correlationId: (request as any).correlationId ?? undefined,
       statusCode: reply.statusCode,
       duration: Math.round(duration),
       userAgent: request.headers["user-agent"] ?? "unknown",

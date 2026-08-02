@@ -119,6 +119,7 @@ export const subscriptionStatuses = [
   "payment_pending",
   "paid",
   "allocation_confirmed",
+  "refund_pending",
   "cancelled",
   "refunded",
 ] as const;
@@ -129,6 +130,7 @@ export const distributionStatuses = [
   "pending_approval",
   "approved",
   "scheduled",
+  "paying",
   "paid",
   "failed",
   "reversed",
@@ -144,7 +146,7 @@ export const milestoneStatuses = [
 ] as const;
 export type MilestoneStatus = (typeof milestoneStatuses)[number];
 
-export const trancheStatuses = ["locked", "eligible", "released", "failed", "reversed"] as const;
+export const trancheStatuses = ["locked", "eligible", "processing", "released", "failed", "reversed"] as const;
 export type TrancheStatus = (typeof trancheStatuses)[number];
 
 export const stages = [
@@ -158,11 +160,39 @@ export const stages = [
 ] as const;
 export type Stage = (typeof stages)[number];
 
+export const distributionLineStatuses = [
+  "pending",
+  "processing",
+  "paid",
+  "failed",
+  "skipped",
+  "reversed",
+] as const;
+export type DistributionLineStatus = (typeof distributionLineStatuses)[number];
+
+export const paymentIntentStatuses = [
+  "pending",
+  "amount_matched",
+  "amount_mismatch",
+  "expired",
+  "cancelled",
+] as const;
+export type PaymentIntentStatus = (typeof paymentIntentStatuses)[number];
+
+export const outboundTransferStatuses = [
+  "pending",
+  "success",
+  "failed",
+  "reversed",
+] as const;
+export type OutboundTransferStatus = (typeof outboundTransferStatuses)[number];
+
 export const entityTypes = [
   "application",
   "offering",
   "subscription",
   "distribution",
+  "distribution_line",
   "milestone",
   "tranche",
   "anchor",
@@ -176,5 +206,8 @@ export const entityTypes = [
   "task",
   "work_order",
   "dispute",
+  "payment_intent",
+  "outbound_transfer",
+  "dedicated_virtual_account",
 ] as const;
 export type EntityType = (typeof entityTypes)[number];

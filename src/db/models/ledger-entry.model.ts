@@ -16,7 +16,7 @@ const ledgerEntrySchema = new Schema(
   {
     ledgerType: {
       type: String,
-      enum: ["escrow", "ownership", "distribution", "tranche", "redemption", "fee"],
+      enum: ["escrow", "ownership", "distribution", "tranche", "redemption", "fee", "tax"],
       required: true,
       index: true,
     },
@@ -27,15 +27,19 @@ const ledgerEntrySchema = new Schema(
     entityType: { type: String, enum: entityTypes, required: true, index: true },
     entityId: { type: String, required: true, index: true },
     externalRef: { type: String, index: true },
-    idempotencyKey: { type: String, index: true },
+    idempotencyKey: { type: String },
     postedAt: { type: Date, required: true, index: true },
     metadata: { type: Schema.Types.Mixed, default: {} },
   },
   { ...timestamped, collection: "ledgerEntries" },
 );
-ledgerEntrySchema.index({ idempotencyKey: 1, ledgerType: 1, accountRef: 1 }, { sparse: true });
+// 3.3: idempotencyKey must be globally unique (sparse so entries without a key
+// are allowed). This is the DB-level double-credit/double-debit backstop.
+ledgerEntrySchema.index({ idempotencyKey: 1 }, { unique: true, sparse: true });
 // 8.1: Compound index for entity lookups
 ledgerEntrySchema.index({ entityType: 1, entityId: 1, createdAt: -1 });
+// Escrow balance reads aggregate by accountRef — index it for direction sums.
+ledgerEntrySchema.index({ accountRef: 1, direction: 1 });
 
 export type LedgerEntryDoc = InferSchemaType<typeof ledgerEntrySchema> & { _id: Types.ObjectId };
 

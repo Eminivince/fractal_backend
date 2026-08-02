@@ -53,60 +53,7 @@ export async function blockchainRoutes(
   // ── POST /blockchain/deploy-token — manually trigger token deployment ───────
   fastify.post("/blockchain/deploy-token", async (request, reply) => {
     authorize(request.user as AuthUser, "execute", "offering");
-
-    const schema = z.object({
-      offeringId: z.string().min(1),
-      tokenName: z.string().min(2).optional(),
-      tokenSymbol: z.string().min(2).max(12).optional(),
-      maxBalancePerHolder: z.number().int().nonnegative().optional(),
-      retailCap: z.number().int().nonnegative().optional(),
-    });
-
-    const body = schema.parse(request.body);
-    const offering = await OfferingModel.findById(body.offeringId);
-    if (!offering) throw new HttpError(404, "Offering not found");
-
-    if (
-      (offering as { tokenDeployment?: { status?: string } }).tokenDeployment
-        ?.status === "deployed"
-    ) {
-      throw new HttpError(409, "Token already deployed for this offering");
-    }
-
-    await enqueueBlockchainOp({
-      opType: "deploy_token",
-      entityType: "offering",
-      entityId: body.offeringId,
-      payload: {
-        tokenName: body.tokenName ?? `Fractal ${offering.name}`,
-        tokenSymbol:
-          body.tokenSymbol ??
-          `FRAC-${offering._id.toString().slice(-4).toUpperCase()}`,
-        maxBalancePerHolder: body.maxBalancePerHolder,
-        retailCap: body.retailCap,
-      },
-    });
-
-    // Update offering to show pending status
-    await OfferingModel.findByIdAndUpdate(body.offeringId, {
-      tokenDeployment: {
-        status: "pending_deploy",
-        contractAddress: "",
-        chainId: env.CHAIN_ID,
-        deployTxHash: "",
-        deployedAt: "",
-        tokenSymbol:
-          body.tokenSymbol ??
-          `FRAC-${offering._id.toString().slice(-4).toUpperCase()}`,
-        defaultPartitionId: 1,
-        totalSupplyIssued: 0,
-      },
-    });
-
-    return reply.send({
-      message: "Token deployment queued",
-      offeringId: body.offeringId,
-    });
+    throw new HttpError(410, "Legacy Mongo-backed deployment is retired; use the governed offering chain-deployment workflow");
   });
 
   // ── POST /blockchain/trigger-mint — batch mint for an offering ──────────────

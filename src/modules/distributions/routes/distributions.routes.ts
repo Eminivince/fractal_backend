@@ -1,8 +1,14 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
-import { BusinessModel, DistributionLineModel, DistributionModel, InvestorProfileModel, LedgerEntryModel, OfferingModel, SubscriptionModel, UserModel } from "../../../db/models.js";
+import { BusinessModel, DistributionLineModel, DistributionModel, InvestorProfileModel, LedgerEntryModel, OfferingModel, OutboundTransferModel, SubscriptionModel, UserModel } from "../../../db/models.js";
 import { createNotificationsFromEvent } from "../../../services/notifications.js";
 import { toDecimal } from "../../../utils/decimal.js";
+import {
+  escrowAccountRef,
+  getEscrowBalance,
+  postLedger,
+  exceedsAvailableEscrow,
+} from "../../../services/ledger.js";
 import { authorize } from "../../../utils/rbac.js";
 import { appendEvent } from "../../../utils/audit.js";
 import { HttpError } from "../../../utils/errors.js";
@@ -13,7 +19,7 @@ import { serialize } from "../../../utils/serialize.js";
 import { createAnchorRecord } from "../../../utils/anchor.js";
 import { readCommandId, runIdempotentCommand } from "../../../utils/idempotency.js";
 import { env } from "../../../config/env.js";
-import { initiatePaystackTransfer, nairaToKobo } from "../../../services/paystack.js";
+import { getAvailableBalanceKobo, initiatePaystackTransfer, nairaToKobo } from "../../../services/paystack.js";
 
 const createDistributionSchema = z.object({
   period: z.string().regex(/^\d{4}-\d{2}$/),
@@ -55,37 +61,14 @@ export async function distributionRoutes(app: FastifyInstance) {
           throw new HttpError(422, "Distributions endpoint is only valid for Template A offerings");
         }
 
-        // I-70: Validate distribution amount against escrow balance
-        const escrowCredits = await LedgerEntryModel.find({
-          ledgerType: { $in: ["escrow", "subscription"] },
-          accountRef: `escrow:offering:${String(offering._id)}`,
-          direction: "credit",
-        })
-          .session(session)
-          .lean();
+        // I-70 / 3.2: Validate distribution amount against the unified escrow balance.
+        // Balance is read from the single canonical escrow key in integer kobo.
+        const { balance: escrowBalance } = await getEscrowBalance(offering._id, session);
 
-        const escrowDebits = await LedgerEntryModel.find({
-          ledgerType: { $in: ["escrow", "subscription", "distribution", "tranche"] },
-          accountRef: `escrow:offering:${String(offering._id)}`,
-          direction: "debit",
-        })
-          .session(session)
-          .lean();
-
-        const totalCredits = escrowCredits.reduce(
-          (sum: number, e: any) => sum + Number(e.amount?.toString() ?? "0"),
-          0,
-        );
-        const totalDebits = escrowDebits.reduce(
-          (sum: number, e: any) => sum + Number(e.amount?.toString() ?? "0"),
-          0,
-        );
-        const escrowBalance = totalCredits - totalDebits;
-
-        // Also check for pending approved/scheduled distributions
+        // Reserve funds for distributions already in flight (not yet debited).
         const pendingDistributions = await DistributionModel.find({
           offeringId: offering._id,
-          status: { $in: ["pending_approval", "approved", "scheduled"] },
+          status: { $in: ["pending_approval", "approved", "scheduled", "paying"] },
         })
           .session(session)
           .lean();
@@ -96,7 +79,15 @@ export async function distributionRoutes(app: FastifyInstance) {
         );
         const availableBalance = escrowBalance - pendingAmount;
 
-        if (payload.amount > availableBalance && availableBalance >= 0) {
+        // 3.2: No `>= 0` bypass. Any distribution exceeding available escrow is rejected,
+        // including when escrow is already depleted (availableBalance < 0).
+        if (
+          exceedsAvailableEscrow({
+            escrowBalance,
+            pendingAmount,
+            requestedAmount: payload.amount,
+          })
+        ) {
           throw new HttpError(
             422,
             `Distribution amount (${payload.amount}) exceeds available escrow balance (${availableBalance.toFixed(2)}). ` +
@@ -320,12 +311,40 @@ export async function distributionRoutes(app: FastifyInstance) {
         payload: { id: params.id, payoutReceiptRefs: payload.payoutReceiptRefs },
         execute: () =>
           runInTransaction(async (session) => {
-            const distribution = await DistributionModel.findById(params.id).session(session);
-            if (!distribution) throw new HttpError(404, "Distribution not found");
+            // 3.4: Atomic compare-and-set claim. Only the writer that flips
+            // scheduled -> paying proceeds; concurrent/retried callers find the
+            // row already claimed and return idempotently. This prevents the
+            // header-less double-payout race.
+            const distribution = await DistributionModel.findOneAndUpdate(
+              { _id: params.id, status: "scheduled" },
+              { $set: { status: "paying", payoutReceiptRefs: payload.payoutReceiptRefs } },
+              { session, new: true },
+            );
 
-            assertTransition("distribution", distribution.status as any, "paid", {
+            if (!distribution) {
+              const current = await DistributionModel.findById(params.id).session(session);
+              if (!current) throw new HttpError(404, "Distribution not found");
+              // Already claimed/settled by a prior call — idempotent success.
+              if (["paying", "paid"].includes(current.status)) {
+                return serialize(current.toObject());
+              }
+              throw new HttpError(
+                409,
+                `Distribution in status "${current.status}" cannot be marked paid`,
+              );
+            }
+
+            // Validate the business rule for the eventual paying -> paid transition.
+            assertTransition("distribution", "paying" as any, "paid", {
               hasPayoutReceipts: payload.payoutReceiptRefs.length > 0,
             });
+
+            // Deterministic idempotency key so retries without an X-Command-Id header
+            // still collapse to a single escrow debit.
+            const escrowDebitKey = commandId ?? `dist:${String(distribution._id)}:escrow-debit`;
+            const feeKey = commandId
+              ? `fee:servicing:${commandId}`
+              : `fee:servicing:dist:${String(distribution._id)}`;
 
             // Gross distribution amount (before fees)
             const grossAmount = Number(distribution.amount.toString());
@@ -338,53 +357,49 @@ export async function distributionRoutes(app: FastifyInstance) {
             const servicingFeeAmount = (grossAmount * servicingFeePct) / 100;
             const netDistributable = grossAmount - servicingFeeAmount;
 
-            distribution.status = "paid";
-            distribution.payoutReceiptRefs = payload.payoutReceiptRefs as any;
-            distribution.paidAt = new Date();
-            await distribution.save({ session });
+            // In manual (non-Paystack) payout mode, settle immediately: paying -> paid.
+            // In Paystack mode, the row stays "paying" until all transfer lines settle
+            // (webhook or sweep flips paying -> paid).
+            if (!env.PAYSTACK_ENABLED) {
+              distribution.status = "paid";
+              distribution.paidAt = new Date();
+              await distribution.save({ session });
+            }
 
             // Aggregate ledger entry for the full distribution debit from offering escrow
-            await LedgerEntryModel.create(
-              [
-                {
-                  ledgerType: "distribution",
-                  accountRef: `offering:${String(distribution.offeringId)}`,
-                  direction: "debit",
-                  amount: toDecimal(grossAmount),
-                  currency: "NGN",
-                  entityType: "distribution",
-                  entityId: String(distribution._id),
-                  externalRef: payload.payoutReceiptRefs[0],
-                  idempotencyKey: commandId,
-                  postedAt: new Date(),
-                  metadata: { payoutReceiptRefs: payload.payoutReceiptRefs },
-                },
-              ],
-              { session },
+            await postLedger(
+              {
+                ledgerType: "distribution",
+                accountRef: escrowAccountRef(distribution.offeringId),
+                direction: "debit",
+                amount: grossAmount,
+                entityType: "distribution",
+                entityId: String(distribution._id),
+                externalRef: payload.payoutReceiptRefs[0],
+                idempotencyKey: escrowDebitKey,
+                metadata: { payoutReceiptRefs: payload.payoutReceiptRefs },
+              },
+              session,
             );
 
             // Fee ledger entry: servicing fee credited to platform
             if (servicingFeeAmount > 0) {
-              await LedgerEntryModel.create(
-                [
-                  {
-                    ledgerType: "fee",
-                    accountRef: "platform:fees",
-                    direction: "credit",
-                    amount: toDecimal(servicingFeeAmount),
-                    currency: "NGN",
-                    entityType: "distribution",
-                    entityId: String(distribution._id),
-                    idempotencyKey: `fee:servicing:${commandId}`,
-                    postedAt: new Date(),
-                    metadata: {
-                      feeType: "servicing",
-                      servicingFeePct,
-                      offeringId: String(distribution.offeringId),
-                    },
+              await postLedger(
+                {
+                  ledgerType: "fee",
+                  accountRef: "platform:fees",
+                  direction: "credit",
+                  amount: servicingFeeAmount,
+                  entityType: "distribution",
+                  entityId: String(distribution._id),
+                  idempotencyKey: feeKey,
+                  metadata: {
+                    feeType: "servicing",
+                    servicingFeePct,
+                    offeringId: String(distribution.offeringId),
                   },
-                ],
-                { session },
+                },
+                session,
               );
             }
 
@@ -403,6 +418,24 @@ export async function distributionRoutes(app: FastifyInstance) {
 
             // I-29: WHT rate from distribution record, default 10%
             const whtPct = Number((distribution as any).whtPct?.toString() ?? "10");
+
+            // Pre-flight: verify Paystack balance before initiating transfers
+            if (env.PAYSTACK_ENABLED && env.PAYSTACK_BALANCE_CHECK_ENABLED) {
+              const totalPayoutKobo = allocatedSubs.reduce((sum: number, sub: any) => {
+                const share = totalAllocated > 0 ? Number(sub.amount.toString()) / totalAllocated : 0;
+                const gross = netDistributable * share;
+                const wht = (gross * whtPct) / 100;
+                return sum + nairaToKobo(gross - wht);
+              }, 0);
+
+              const availableKobo = await getAvailableBalanceKobo();
+              if (totalPayoutKobo > 0 && availableKobo < totalPayoutKobo) {
+                throw new HttpError(
+                  422,
+                  `Insufficient Paystack balance for distribution payout. Required: ₦${(totalPayoutKobo / 100).toFixed(2)}, Available: ₦${(availableKobo / 100).toFixed(2)}. Fund your Paystack balance before proceeding.`,
+                );
+              }
+            }
 
             const paystackTransferRefs: string[] = [];
 
@@ -490,6 +523,8 @@ export async function distributionRoutes(app: FastifyInstance) {
               }
 
               // Trigger Paystack transfer if investor has a registered bank account
+              // CRITICAL: Do NOT mark as "paid" here. Transfer settles asynchronously.
+              // The transfer.success webhook (or sweep worker) will mark it "paid".
               if (env.PAYSTACK_ENABLED) {
                 const profile = await InvestorProfileModel.findOne({
                   userId: sub.investorUserId,
@@ -507,10 +542,37 @@ export async function distributionRoutes(app: FastifyInstance) {
                     });
                     paystackTransferRefs.push(transfer.transfer_code);
 
-                    // Mark the distribution line as paid
+                    // Track the outbound transfer — status stays "pending" until webhook confirms
+                    await OutboundTransferModel.create(
+                      [
+                        {
+                          transferCode: transfer.transfer_code,
+                          reference: investorRef,
+                          recipientCode: profile.bankAccount.recipientCode,
+                          amountKobo: nairaToKobo(investorNet),
+                          currency: "NGN",
+                          reason: `Distribution ${distribution.period} — ${offering.name}`,
+                          status: "pending",
+                          entityType: "distribution_line",
+                          entityId: String(
+                            (
+                              await DistributionLineModel.findOne({
+                                distributionId: distribution._id,
+                                investorUserId: sub.investorUserId,
+                              })
+                                .session(session)
+                                .lean()
+                            )?._id,
+                          ),
+                        },
+                      ],
+                      { session },
+                    );
+
+                    // Mark line as "processing" — NOT "paid"
                     await DistributionLineModel.updateOne(
                       { distributionId: distribution._id, investorUserId: sub.investorUserId },
-                      { status: "paid", paymentRef: transfer.transfer_code, paidAt: new Date() },
+                      { status: "processing", paymentRef: transfer.transfer_code },
                     ).session(session);
                   } catch (err: any) {
                     // Log but do not fail the transaction — manual follow-up required
@@ -523,6 +585,16 @@ export async function distributionRoutes(app: FastifyInstance) {
                       { status: "failed", failureReason: err.message },
                     ).session(session);
                   }
+                } else {
+                  // Investor has no bank account registered — skip payout
+                  await DistributionLineModel.updateOne(
+                    { distributionId: distribution._id, investorUserId: sub.investorUserId },
+                    { status: "skipped", failureReason: "No bank account registered. Investor must add bank details in settings." },
+                  ).session(session);
+                  app.log.info(
+                    { investorUserId: String(sub.investorUserId) },
+                    "Distribution line skipped: investor has no bank account",
+                  );
                 }
               }
             }
@@ -652,23 +724,19 @@ export async function distributionRoutes(app: FastifyInstance) {
             distribution.reversedAt = new Date();
             await distribution.save({ session });
 
-            await LedgerEntryModel.create(
-              [
-                {
-                  ledgerType: "distribution",
-                  accountRef: `offering:${String(distribution.offeringId)}`,
-                  direction: "credit",
-                  amount: distribution.amount,
-                  currency: "NGN",
-                  entityType: "distribution",
-                  entityId: String(distribution._id),
-                  externalRef: payload.trusteeTicket,
-                  idempotencyKey: commandId,
-                  postedAt: new Date(),
-                  metadata: { reason: payload.reason },
-                },
-              ],
-              { session },
+            await postLedger(
+              {
+                ledgerType: "distribution",
+                accountRef: escrowAccountRef(distribution.offeringId),
+                direction: "credit",
+                amount: distribution.amount,
+                entityType: "distribution",
+                entityId: String(distribution._id),
+                externalRef: payload.trusteeTicket,
+                idempotencyKey: commandId ?? `dist:${String(distribution._id)}:reverse`,
+                metadata: { reason: payload.reason },
+              },
+              session,
             );
 
             await appendEvent(
@@ -855,11 +923,26 @@ export async function distributionRoutes(app: FastifyInstance) {
         payload: { lineId: params.lineId },
         execute: () =>
           runInTransaction(async (session) => {
-            const line = await DistributionLineModel.findById(params.lineId).session(session);
-            if (!line) throw new HttpError(404, "Distribution line not found");
+            // 3.4: Atomically claim the failed line for retry and bump the attempt
+            // counter. Concurrent retries cannot both proceed; the reference is
+            // derived from retryCount (deterministic per attempt, distinct across
+            // attempts) so Paystack dedupe still protects against double payout.
+            const line = await DistributionLineModel.findOneAndUpdate(
+              { _id: params.lineId, status: "failed" },
+              { $set: { status: "processing" }, $inc: { retryCount: 1 } },
+              { session, new: true },
+            );
 
-            if (line.status !== "failed") {
-              throw new HttpError(422, `Distribution line is in "${line.status}" status — only failed lines can be retried`);
+            if (!line) {
+              const current = await DistributionLineModel.findById(params.lineId).session(session);
+              if (!current) throw new HttpError(404, "Distribution line not found");
+              if (["processing", "paid"].includes(current.status)) {
+                return serialize(current.toObject());
+              }
+              throw new HttpError(
+                422,
+                `Distribution line is in "${current.status}" status — only failed lines can be retried`,
+              );
             }
 
             const distribution = await DistributionModel.findById(line.distributionId).session(session);
@@ -869,7 +952,7 @@ export async function distributionRoutes(app: FastifyInstance) {
             if (!offering) throw new HttpError(404, "Offering not found");
 
             const netAmount = Number(line.netAmount.toString());
-            const investorRef = `retry:dist:${String(line.distributionId)}:inv:${String(line.investorUserId)}:${Date.now()}`;
+            const investorRef = `retry:dist:${String(line.distributionId)}:inv:${String(line.investorUserId)}:${line.retryCount}`;
 
             if (env.PAYSTACK_ENABLED) {
               const profile = await InvestorProfileModel.findOne({ userId: line.investorUserId })
@@ -890,9 +973,27 @@ export async function distributionRoutes(app: FastifyInstance) {
                 reason: `Retry: Distribution ${distribution.period} — ${offering.name}`,
               });
 
-              line.status = "paid";
+              // Track outbound transfer — stays "pending" until webhook confirms
+              await OutboundTransferModel.create(
+                [
+                  {
+                    transferCode: transfer.transfer_code,
+                    reference: investorRef,
+                    recipientCode: profile.bankAccount.recipientCode,
+                    amountKobo: nairaToKobo(netAmount),
+                    currency: "NGN",
+                    reason: `Retry: Distribution ${distribution.period} — ${offering.name}`,
+                    status: "pending",
+                    entityType: "distribution_line",
+                    entityId: String(line._id),
+                  },
+                ],
+                { session },
+              );
+
+              // Mark as "processing" — NOT "paid". Webhook will finalize.
+              line.status = "processing" as any;
               line.paymentRef = transfer.transfer_code;
-              line.paidAt = new Date();
               line.failureReason = undefined as any;
               await line.save({ session });
 
@@ -901,7 +1002,7 @@ export async function distributionRoutes(app: FastifyInstance) {
                 {
                   entityType: "distribution",
                   entityId: String(distribution._id),
-                  action: "DistributionLineRetrySucceeded",
+                  action: "DistributionLineRetryInitiated",
                   notes: `lineId:${params.lineId} ref:${transfer.transfer_code}`,
                 },
                 session,
@@ -909,7 +1010,7 @@ export async function distributionRoutes(app: FastifyInstance) {
 
               return serialize({
                 lineId: params.lineId,
-                status: "paid",
+                status: "processing",
                 transferCode: transfer.transfer_code,
                 amount: netAmount,
                 currency: "NGN",

@@ -1,14 +1,6 @@
-import { EventEmitter } from "node:events";
-
 /**
- * In-process event bus for real-time SSE fan-out.
- * Each connected client subscribes to `user:<userId>` events.
+ * Event bus — re-exports from durable-event-bus (B5).
+ * Preserves import paths for all existing consumers.
  */
-export const eventBus = new EventEmitter();
 
-// Allow up to 5000 concurrent SSE connections without emitting warnings.
-eventBus.setMaxListeners(5000);
-
-export function emitUserEvent(userId: string, payload: Record<string, unknown>): void {
-  eventBus.emit(`user:${userId}`, payload);
-}
+export { eventBus, emitUserEvent, onUserEvent } from "./durable-event-bus.js";

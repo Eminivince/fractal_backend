@@ -1,14 +1,15 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
+import { booleanFromString } from "../../../utils/boolean.js";
 import { NotificationModel } from "../../../db/models.js";
 import { authorize } from "../../../utils/rbac.js";
 import { HttpError } from "../../../utils/errors.js";
 import { serialize } from "../../../utils/serialize.js";
-import { eventBus } from "../../../services/event-bus.js";
+import { onUserEvent } from "../../../services/event-bus.js";
 
 const listNotificationsQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(200).default(30),
-  unreadOnly: z.coerce.boolean().default(false),
+  unreadOnly: booleanFromString(false),
 });
 
 export async function notificationRoutes(app: FastifyInstance) {
@@ -93,7 +94,6 @@ export async function notificationRoutes(app: FastifyInstance) {
       }
 
       const userId = authUser.userId;
-      const eventKey = `user:${userId}`;
 
       const origin = request.headers.origin ?? "*";
       reply.raw.writeHead(200, {
@@ -117,7 +117,9 @@ export async function notificationRoutes(app: FastifyInstance) {
         }
       };
 
-      eventBus.on(eventKey, onEvent);
+      // Subscribe via the Redis-backed bus so pushes work across instances behind
+      // a load balancer (in-memory eventBus.on only delivered same-instance events).
+      const unsubscribe = onUserEvent(userId, onEvent);
 
       // Heartbeat every 25s to keep connection alive through proxies
       const heartbeat = setInterval(() => {
@@ -131,7 +133,7 @@ export async function notificationRoutes(app: FastifyInstance) {
       // Cleanup when client disconnects
       request.raw.on("close", () => {
         clearInterval(heartbeat);
-        eventBus.off(eventKey, onEvent);
+        unsubscribe();
       });
 
       // Keep the handler pending — Fastify must not send a normal reply

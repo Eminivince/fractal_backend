@@ -61,11 +61,15 @@ export function startWorkOrderSlaWorker(
         return;
       }
 
-      const token = (app as any).jwt.sign({
-        userId: String(actor._id),
-        role: actor.role,
-        businessId: actor.businessId ? String(actor.businessId) : undefined,
-      });
+      // 3.7: short-lived token — used immediately for one internal inject call.
+      const token = (app as any).jwt.sign(
+        {
+          userId: String(actor._id),
+          role: actor.role,
+          businessId: actor.businessId ? String(actor.businessId) : undefined,
+        },
+        { expiresIn: "5m" },
+      );
 
       const response = await app.inject({
         method: "POST",

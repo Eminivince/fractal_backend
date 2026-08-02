@@ -1,0 +1,59 @@
+{
+  "schemaVersion": "privacy-chain-probe-job-v2",
+  "probeReference": "PRIVACY-CHAIN-PROBE-YYYY-MM-DD-01",
+  "identityId": "00000000-0000-4000-8000-000000000000",
+  "policyBinding": {
+    "configurationKey": "privacy.external_source.adapter_policy",
+    "versionId": "00000000-0000-4000-8000-000000000000",
+    "versionNumber": 1,
+    "projectionVersion": 1,
+    "valueSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "implementation": {
+    "adapterKey": "fractal.external.chain.public-records",
+    "version": "1.0.0",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "releaseSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "coverage": {
+    "inventoryVersion": "privacy-external-coverage-v1",
+    "componentKeys": [
+      "verified_wallet_links",
+      "allocation_chain_transactions",
+      "approved_ownership_snapshots"
+    ]
+  },
+  "provider": {
+    "environment": "production",
+    "accountReference": "APPROVED-PRODUCTION-RPC-ACCOUNT-REFERENCE",
+    "regionReference": "APPROVED-PRODUCTION-RPC-REGION-REFERENCE"
+  },
+  "chains": [
+    {
+      "chainId": 11155111,
+      "endpointReference": "APPROVED-SEPOLIA-RPC-ENDPOINT-REFERENCE",
+      "endpointSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "execution": {
+    "timeoutMs": 10000,
+    "maximumRecords": 10000,
+    "maximumBytes": 10485760,
+    "evidenceMaximumAgeSeconds": 3600
+  },
+  "governedEvidence": {
+    "portability": "0000000000000000000000000000000000000000000000000000000000000000",
+    "correction": "0000000000000000000000000000000000000000000000000000000000000000",
+    "erasure": "0000000000000000000000000000000000000000000000000000000000000000",
+    "restriction": "0000000000000000000000000000000000000000000000000000000000000000",
+    "objection": "0000000000000000000000000000000000000000000000000000000000000000",
+    "residency": "0000000000000000000000000000000000000000000000000000000000000000",
+    "retention": "0000000000000000000000000000000000000000000000000000000000000000",
+    "deletion": "0000000000000000000000000000000000000000000000000000000000000000",
+    "security": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "signer": {
+    "keyId": "privacy-probe-YYYY-01",
+    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nREPLACE_WITH_APPROVED_ED25519_PUBLIC_KEY\n-----END PUBLIC KEY-----"
+  }
+}

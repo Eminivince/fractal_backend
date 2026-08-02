@@ -138,6 +138,7 @@ export async function businessTeamRoutes(app: FastifyInstance) {
           <p>This invite expires in ${INVITE_TTL_DAYS} days. If you did not expect this invitation, you can ignore this email.</p>
           <p>— The Fractal Team</p>
         `.trim(),
+        idempotencyKey: `fractal-legacy-business-invitation-${String((invite as any)._id)}`,
       }).catch(() => {
         // Email delivery failure is non-fatal — invite is still valid
       });

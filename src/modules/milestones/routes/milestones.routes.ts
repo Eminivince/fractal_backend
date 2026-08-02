@@ -1,7 +1,8 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
-import { BusinessModel, LedgerEntryModel, MilestoneModel, OfferingModel, TrancheModel } from "../../../db/models.js";
+import { BusinessModel, LedgerEntryModel, MilestoneModel, OfferingModel, OutboundTransferModel, TrancheModel } from "../../../db/models.js";
 import { toDecimal } from "../../../utils/decimal.js";
+import { escrowAccountRef, getEscrowBalance, postLedger } from "../../../services/ledger.js";
 import { authorize } from "../../../utils/rbac.js";
 import { appendEvent } from "../../../utils/audit.js";
 import { HttpError } from "../../../utils/errors.js";
@@ -11,6 +12,13 @@ import { runInTransaction } from "../../../utils/tx.js";
 import { serialize } from "../../../utils/serialize.js";
 import { createAnchorRecord } from "../../../utils/anchor.js";
 import { readCommandId, runIdempotentCommand } from "../../../utils/idempotency.js";
+import { env } from "../../../config/env.js";
+import {
+  createPaystackTransferRecipient,
+  getAvailableBalanceKobo,
+  initiatePaystackTransfer,
+  nairaToKobo,
+} from "../../../services/paystack.js";
 
 const milestoneInputSchema = z.object({
   milestones: z
@@ -351,7 +359,19 @@ export async function milestoneRoutes(app: FastifyInstance) {
       }
       authorize(request.authUser, "execute", "tranche");
       const params = z.object({ id: z.string() }).parse(request.params);
-      const payload = z.object({ payoutReceiptRefs: z.array(z.string().min(6)).min(1) }).parse(request.body);
+
+      // When Paystack is enabled, payoutReceiptRefs are optional — the transfer reference is generated.
+      // When Paystack is disabled (manual mode), payoutReceiptRefs are required as proof of manual payout.
+      const payload = z
+        .object({
+          payoutReceiptRefs: z.array(z.string().min(6)).min(1).optional(),
+        })
+        .parse(request.body);
+
+      if (!env.PAYSTACK_ENABLED && (!payload.payoutReceiptRefs || payload.payoutReceiptRefs.length === 0)) {
+        throw new HttpError(422, "payoutReceiptRefs required when Paystack is not enabled (manual payout mode)");
+      }
+
       const commandId = readCommandId(request.headers);
 
       return runIdempotentCommand({
@@ -361,73 +381,186 @@ export async function milestoneRoutes(app: FastifyInstance) {
         payload: { id: params.id, payoutReceiptRefs: payload.payoutReceiptRefs },
         execute: () =>
           runInTransaction(async (session) => {
-            const tranche = await TrancheModel.findById(params.id).session(session);
-            if (!tranche) throw new HttpError(404, "Tranche not found");
+            // 3.4: Atomically claim the eligible tranche (eligible -> processing).
+            // Concurrent/retried releases cannot both proceed.
+            const tranche = await TrancheModel.findOneAndUpdate(
+              { _id: params.id, status: "eligible" },
+              { $set: { status: "processing" } },
+              { session, new: true },
+            );
+            if (!tranche) {
+              const current = await TrancheModel.findById(params.id).session(session);
+              if (!current) throw new HttpError(404, "Tranche not found");
+              if (["processing", "released"].includes(current.status)) {
+                return serialize(current.toObject());
+              }
+              throw new HttpError(409, `Tranche is "${current.status}", expected "eligible"`);
+            }
 
             const offering = await OfferingModel.findById(tranche.offeringId).session(session);
             if (!offering) throw new HttpError(404, "Offering not found for tranche");
 
             const business = await BusinessModel.findById(offering.businessId).session(session);
-            const payoutAccount = business ? (business as any).payoutBankAccount : null;
+            if (!business) throw new HttpError(404, "Business not found for offering");
+            const payoutAccount = (business as any).payoutBankAccount;
             const currency = payoutAccount?.currency ?? "NGN";
 
+            const trancheAmountNaira = toNumber(tranche.amount);
+            const amountKobo = nairaToKobo(trancheAmountNaira);
+            if (amountKobo <= 0) {
+              throw new HttpError(422, "Tranche amount must be positive");
+            }
+
+            // §4: Validate the release against ACTUAL collected escrow (not the
+            // Paystack float balance). A partially-funded offering cannot over-release.
+            const { balance: escrowBalanceNaira } = await getEscrowBalance(tranche.offeringId, session);
+            if (trancheAmountNaira > escrowBalanceNaira) {
+              throw new HttpError(
+                422,
+                `Tranche amount (${trancheAmountNaira}) exceeds collected escrow balance (${escrowBalanceNaira.toFixed(2)}).`,
+              );
+            }
+
+            // --- Paystack-enabled path: initiate real bank transfer ---
+            if (env.PAYSTACK_ENABLED) {
+              if (!payoutAccount?.accountNumber || !payoutAccount?.bankCode) {
+                throw new HttpError(
+                  422,
+                  "Business payout bank account is incomplete — accountNumber and bankCode required",
+                );
+              }
+
+              // Balance pre-flight check
+              if (env.PAYSTACK_BALANCE_CHECK_ENABLED) {
+                const availableKobo = await getAvailableBalanceKobo();
+                if (availableKobo < amountKobo) {
+                  throw new HttpError(
+                    422,
+                    `Insufficient Paystack balance: available ${availableKobo / 100} NGN, required ${amountKobo / 100} NGN`,
+                  );
+                }
+              }
+
+              // Ensure business has a Paystack transfer recipient
+              let recipientCode = payoutAccount.recipientCode;
+              if (!recipientCode) {
+                const recipient = await createPaystackTransferRecipient({
+                  name: payoutAccount.accountName || (business as any).name,
+                  accountNumber: payoutAccount.accountNumber,
+                  bankCode: payoutAccount.bankCode,
+                });
+                recipientCode = recipient.recipient_code;
+                // Persist recipient code so we don't re-create it
+                await BusinessModel.updateOne(
+                  { _id: business._id },
+                  { $set: { "payoutBankAccount.recipientCode": recipientCode } },
+                ).session(session);
+              }
+
+              // 3.4: Deterministic reference (no Date.now()) so Paystack's own
+              // duplicate-reference protection guards against double release.
+              const transferRef = `tranche-${String(tranche._id)}`;
+              const transfer = await initiatePaystackTransfer({
+                recipientCode,
+                amountKobo,
+                reference: transferRef,
+                reason: `Tranche release for offering ${String(tranche.offeringId)}`,
+              });
+
+              // Create outbound transfer record for webhook lifecycle tracking
+              await OutboundTransferModel.create(
+                [
+                  {
+                    transferCode: transfer.transfer_code,
+                    reference: transferRef,
+                    recipientCode,
+                    amountKobo,
+                    currency: "NGN",
+                    reason: `Tranche release for offering ${String(tranche.offeringId)}`,
+                    status: "pending",
+                    entityType: "tranche_release",
+                    entityId: String(tranche._id),
+                    paystackStatus: transfer.status,
+                  },
+                ],
+                { session },
+              );
+
+              // Tranche was already atomically claimed to "processing". Released
+              // happens via the transfer.success webhook.
+              tranche.releasedBy = request.authUser.userId as any;
+              tranche.payoutReceiptRefs = [transferRef] as any;
+              await tranche.save({ session });
+
+              await appendEvent(
+                request.authUser,
+                {
+                  entityType: "tranche",
+                  entityId: String(tranche._id),
+                  action: "TrancheReleaseInitiated",
+                  notes: `Paystack transfer initiated: ${transfer.transfer_code}`,
+                },
+                session,
+              );
+
+              return serialize(tranche.toObject());
+            }
+
+            // --- Manual mode (Paystack disabled): immediate release with receipt refs ---
+            const receiptRefs = payload.payoutReceiptRefs!;
+            const trancheLedgerKey = commandId ?? `tranche:${String(tranche._id)}`;
+
             assertTransition("tranche", tranche.status as any, "released", {
-              hasPayoutReceipts: payload.payoutReceiptRefs.length > 0,
+              hasPayoutReceipts: receiptRefs.length > 0,
             });
             tranche.status = "released";
-            tranche.payoutReceiptRefs = payload.payoutReceiptRefs as any;
+            tranche.payoutReceiptRefs = receiptRefs as any;
             tranche.releasedBy = request.authUser.userId as any;
             tranche.releasedAt = new Date();
             await tranche.save({ session });
 
             // Debit the offering escrow (funds leaving escrow)
-            await LedgerEntryModel.create(
-              [
-                {
-                  ledgerType: "tranche",
-                  accountRef: `escrow:offering:${String(tranche.offeringId)}`,
-                  direction: "debit",
-                  amount: tranche.amount,
-                  currency,
-                  entityType: "tranche",
-                  entityId: String(tranche._id),
-                  externalRef: payload.payoutReceiptRefs[0],
-                  idempotencyKey: commandId ? `${commandId}:debit` : undefined,
-                  postedAt: new Date(),
-                  metadata: { payoutReceiptRefs: payload.payoutReceiptRefs },
-                },
-              ],
-              { session },
+            await postLedger(
+              {
+                ledgerType: "tranche",
+                accountRef: escrowAccountRef(tranche.offeringId),
+                direction: "debit",
+                amount: tranche.amount,
+                currency,
+                entityType: "tranche",
+                entityId: String(tranche._id),
+                externalRef: receiptRefs[0],
+                idempotencyKey: `${trancheLedgerKey}:debit`,
+                metadata: { payoutReceiptRefs: receiptRefs },
+              },
+              session,
             );
 
             // Credit the issuer (funds arriving at issuer)
-            await LedgerEntryModel.create(
-              [
-                {
-                  ledgerType: "tranche",
-                  accountRef: `issuer:business:${String(offering.businessId)}`,
-                  direction: "credit",
-                  amount: tranche.amount,
-                  currency,
-                  entityType: "tranche",
-                  entityId: String(tranche._id),
-                  externalRef: payload.payoutReceiptRefs[0],
-                  idempotencyKey: commandId ? `${commandId}:credit` : undefined,
-                  postedAt: new Date(),
-                  metadata: {
-                    payoutReceiptRefs: payload.payoutReceiptRefs,
-                    disbursementType: "tranche_payout",
-                    ...(payoutAccount?.accountNumber
-                      ? {
-                          bankName: payoutAccount.bankName,
-                          accountNumber: payoutAccount.accountNumber,
-                          accountName: payoutAccount.accountName,
-                        }
-                      : {}),
-                  },
+            await postLedger(
+              {
+                ledgerType: "tranche",
+                accountRef: `issuer:business:${String(offering.businessId)}`,
+                direction: "credit",
+                amount: tranche.amount,
+                currency,
+                entityType: "tranche",
+                entityId: String(tranche._id),
+                externalRef: receiptRefs[0],
+                idempotencyKey: `${trancheLedgerKey}:credit`,
+                metadata: {
+                  payoutReceiptRefs: receiptRefs,
+                  disbursementType: "tranche_payout",
+                  ...(payoutAccount?.accountNumber
+                    ? {
+                        bankName: payoutAccount.bankName,
+                        accountNumber: payoutAccount.accountNumber,
+                        accountName: payoutAccount.accountName,
+                      }
+                    : {}),
                 },
-              ],
-              { session },
+              },
+              session,
             );
 
             const anchor = await createAnchorRecord(
@@ -436,7 +569,7 @@ export async function milestoneRoutes(app: FastifyInstance) {
                 entityId: String(tranche._id),
                 eventType: "TrancheReleased",
                 payload: {
-                  payoutReceiptRefs: payload.payoutReceiptRefs,
+                  payoutReceiptRefs: receiptRefs,
                   amount: tranche.amount.toString(),
                 },
               },
@@ -542,7 +675,7 @@ export async function milestoneRoutes(app: FastifyInstance) {
               [
                 {
                   ledgerType: "tranche",
-                  accountRef: `offering:${String(tranche.offeringId)}`,
+                  accountRef: escrowAccountRef(tranche.offeringId),
                   direction: "credit",
                   amount: tranche.amount,
                   currency: "NGN",

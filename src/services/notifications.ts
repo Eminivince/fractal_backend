@@ -63,6 +63,7 @@ function toName(value: unknown): string | undefined {
 
 function humanizeAction(action: string): string {
   const spaced = action
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .replace(/\s+/g, " ")
@@ -442,6 +443,7 @@ export async function processPendingNotificationEmails(batchSize = 20): Promise<
       subject: body.subject,
       text: body.text,
       html: body.html,
+      idempotencyKey: `fractal-notification-${id}`,
     });
 
     if (sendResult.status === "sent") {
@@ -450,6 +452,7 @@ export async function processPendingNotificationEmails(batchSize = 20): Promise<
         $set: {
           "channels.email.status": "sent",
           "channels.email.provider": sendResult.provider,
+          "channels.email.providerMessageId": sendResult.providerMessageId,
           "channels.email.sentAt": new Date(),
           "channels.email.lastAttemptAt": new Date(),
         },

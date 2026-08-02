@@ -3,8 +3,10 @@
  * Abstraction layer for private key management.
  *
  * Default provider reads keys from environment variables (current behavior).
- * Set KEY_MANAGEMENT_PROVIDER to "aws_kms" or "vault" for production-grade
- * key management — those integrations are stubbed here as extension points.
+ * AWS KMS and Vault are explicitly unsupported extension points in this
+ * revision. The environment schema refuses every on-chain worker in production
+ * until a reviewed external EVM signer is integrated; it must never quietly
+ * fall back from one provider to another.
  */
 import { env } from "../config/env.js";
 
@@ -33,14 +35,16 @@ class EnvKeyProvider implements KeyProvider {
   }
 }
 
-// ── AWS KMS provider stub ───────────────────────────────────────────────────
+// ── External-provider extension points ──────────────────────────────────────
 
 class AwsKmsKeyProvider implements KeyProvider {
   async getPrivateKey(_keyName: KeyName): Promise<`0x${string}`> {
-    // Integration point: use @aws-sdk/client-kms to retrieve or sign with KMS keys.
-    // KMS key IDs should be mapped from keyName via env vars (e.g. KMS_FRACTAL_AGENT_KEY_ID).
+    // An asymmetric KMS key must sign EVM digests without exporting a private
+    // key. That requires a LocalAccount-compatible signer, DER-signature
+    // normalization/recovery, public-key/address validation, IAM policy, and
+    // integration tests. Returning a private key here would defeat KMS.
     throw new Error(
-      "AWS KMS provider not implemented. Install @aws-sdk/client-kms and configure KMS key IDs.",
+      "AWS KMS EVM signer is not implemented; on-chain execution is deliberately blocked for this provider.",
     );
   }
 }
@@ -49,10 +53,10 @@ class AwsKmsKeyProvider implements KeyProvider {
 
 class VaultKeyProvider implements KeyProvider {
   async getPrivateKey(_keyName: KeyName): Promise<`0x${string}`> {
-    // Integration point: use node-vault or HTTP API to read secrets from Vault.
-    // Vault address and token should come from env vars (VAULT_ADDR, VAULT_TOKEN).
+    // Vault must expose a reviewed EVM signing operation rather than return a
+    // raw private key to the application process.
     throw new Error(
-      "Vault provider not implemented. Install node-vault and configure VAULT_ADDR/VAULT_TOKEN.",
+      "Vault EVM signer is not implemented; on-chain execution is deliberately blocked for this provider.",
     );
   }
 }

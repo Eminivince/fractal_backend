@@ -31,7 +31,9 @@ const blockchainOpSchema = new Schema(
     entityId: { type: String, required: true, index: true },
     status: {
       type: String,
-      enum: ["pending", "submitted", "confirmed", "failed"],
+      // 3.5: "dead_letter" is a terminal state the worker sets after exhausting
+      // retries; it was previously dropped by strict mode (not in the enum).
+      enum: ["pending", "submitted", "confirmed", "failed", "dead_letter"],
       default: "pending",
       index: true,
     },
@@ -39,6 +41,8 @@ const blockchainOpSchema = new Schema(
     submittedAt: { type: Date },
     confirmedAt: { type: Date },
     retryCount: { type: Number, default: 0 },
+    // 3.5: exponential-backoff next-attempt time written by the worker.
+    nextRetryAt: { type: Date, index: true },
     error: { type: String },
     // Extra context for the worker to know what to do
     payload: { type: Schema.Types.Mixed, default: {} },

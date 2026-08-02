@@ -26,6 +26,10 @@ const eventLogSchema = new Schema(
     timestamp: { type: Date, required: true, index: true },
     notes: { type: String },
     diff: { type: Schema.Types.Mixed },
+    // Tamper-evident hash chain: hash = sha256(prevHash + canonical(event fields)).
+    // Lets an auditor detect altered/inserted records (WORM-grade trail).
+    hash: { type: String, index: true },
+    prevHash: { type: String },
   },
   { collection: "eventLogs" },
 );

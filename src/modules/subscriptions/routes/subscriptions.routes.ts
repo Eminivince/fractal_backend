@@ -1,17 +1,23 @@
+import { createHash } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import mongoose from "mongoose";
 import { z } from "zod";
 import {
   CorporateActionModel,
+  DedicatedVirtualAccountModel,
   EscrowReceiptModel,
   InvestorProfileModel,
   LedgerEntryModel,
   OfferingModel,
+  OutboundTransferModel,
+  PaymentIntentModel,
   PlatformConfigModel,
+  SuitabilityAssessmentModel,
   SubscriptionModel,
   UserModel,
 } from "../../../db/models.js";
 import { toDecimal } from "../../../utils/decimal.js";
+import { escrowAccountRef } from "../../../services/ledger.js";
 import { authorize } from "../../../utils/rbac.js";
 import { appendEvent } from "../../../utils/audit.js";
 import { HttpError } from "../../../utils/errors.js";
@@ -21,9 +27,25 @@ import { runInTransaction } from "../../../utils/tx.js";
 import { serialize } from "../../../utils/serialize.js";
 import { readCommandId, runIdempotentCommand } from "../../../utils/idempotency.js";
 import { env } from "../../../config/env.js";
-import { initializePaystackTransaction } from "../../../services/paystack.js";
+import {
+  createPaystackCustomer,
+  createPaystackDedicatedVirtualAccount,
+  initializePaystackTransaction,
+  initiatePaystackRefund,
+  nairaToKobo,
+} from "../../../services/paystack.js";
+import { createNotificationsFromEvent } from "../../../services/notifications.js";
 
-const subscribeSchema = z.object({ amount: z.number().positive() });
+const subscribeSchema = z.object({
+  amount: z.number().positive(),
+  // E-signature: the investor must execute the subscription agreement.
+  agreement: z.object({
+    accepted: z.literal(true),
+    signature: z.string().min(2).max(200), // typed full legal name
+    agreementVersion: z.string().min(1).optional(),
+    documentHash: z.string().min(16).optional(), // sha256 of the agreement the investor saw
+  }),
+});
 
 const paymentReceiptSchema = z.object({
   externalRef: z.string().min(6),
@@ -157,12 +179,130 @@ export async function subscriptionRoutes(app: FastifyInstance) {
               }
             }
 
+            // C2: Accredited investor verification for high-risk offerings
+            if (offering.minimumRiskTier >= 4) {
+              if (profile?.accreditationStatus !== "verified") {
+                await appendEvent(
+                  request.authUser,
+                  { entityType: "subscription", entityId: "pre-creation", action: "AccreditationCheckFailed", notes: `offering:${params.id} required tier >= 4` },
+                  session,
+                );
+                throw new HttpError(422, "This offering requires accredited investor status. Please complete accreditation verification.");
+              }
+              const ACCREDITATION_VALIDITY_MONTHS = 12;
+              if (profile.accreditationVerifiedAt) {
+                const expiryDate = new Date(profile.accreditationVerifiedAt);
+                expiryDate.setMonth(expiryDate.getMonth() + ACCREDITATION_VALIDITY_MONTHS);
+                if (new Date() > expiryDate) {
+                  throw new HttpError(422, "Your accreditation verification has expired. Please renew your accreditation.");
+                }
+              }
+            }
+
+            // C3: AML/sanctions screening gate
+            const investorJurisdiction = profile?.jurisdiction;
+            const juris = investorJurisdiction && (config.jurisdictions as any[])?.find(
+              (j: any) => j.code === investorJurisdiction && j.enabled,
+            );
+            const amlRequired = juris ? juris.amlRequired !== false : true;
+            if (amlRequired && profile?.amlStatus !== "clear") {
+              await appendEvent(
+                request.authUser,
+                { entityType: "subscription", entityId: "pre-creation", action: "AMLCheckFailed", notes: `offering:${params.id} amlStatus:${profile?.amlStatus}` },
+                session,
+              );
+              throw new HttpError(422, "AML screening is not cleared. Please wait for your screening to complete before subscribing.");
+            }
+
+            // C4: Suitability assessment enforcement
+            if (offering.minimumRiskTier > 0) {
+              const latestAssessment = await SuitabilityAssessmentModel.findOne({
+                investorUserId: request.authUser.userId,
+              }).sort({ completedAt: -1 }).session(session).lean();
+
+              if (!latestAssessment || new Date() > new Date((latestAssessment as any).expiresAt)) {
+                await appendEvent(
+                  request.authUser,
+                  { entityType: "subscription", entityId: "pre-creation", action: "SuitabilityCheckFailed", notes: `offering:${params.id} reason:${!latestAssessment ? "missing" : "expired"}` },
+                  session,
+                );
+                throw new HttpError(422, !latestAssessment
+                  ? "A suitability assessment is required before subscribing to this offering. Please complete the questionnaire."
+                  : "Your suitability assessment has expired. Please retake the questionnaire.");
+              }
+              if ((latestAssessment as any).riskTier > offering.minimumRiskTier) {
+                await appendEvent(
+                  request.authUser,
+                  { entityType: "subscription", entityId: "pre-creation", action: "SuitabilityCheckFailed", notes: `offering:${params.id} investorTier:${(latestAssessment as any).riskTier} requiredTier:${offering.minimumRiskTier}` },
+                  session,
+                );
+                throw new HttpError(
+                  422,
+                  `Your risk profile (tier ${(latestAssessment as any).riskTier}) does not meet this offering's suitability requirement (tier ${offering.minimumRiskTier} or below).`,
+                );
+              }
+            }
+
+            // C6: Per-jurisdiction investment limits and eligible investor tiers
+            if (juris) {
+              if (juris.eligibleInvestorTiers?.length > 0 && !juris.eligibleInvestorTiers.includes(profile?.eligibility)) {
+                await appendEvent(
+                  request.authUser,
+                  { entityType: "subscription", entityId: "pre-creation", action: "JurisdictionCheckFailed", notes: `offering:${params.id} jurisdiction:${juris.code} tier:${profile?.eligibility}` },
+                  session,
+                );
+                throw new HttpError(422, `Investors with "${profile?.eligibility}" status are not eligible to invest from jurisdiction ${juris.name}.`);
+              }
+              const jurisMax = toNumber(juris.maxInvestmentAmount ?? 0);
+              if (jurisMax > 0 && payload.amount > jurisMax) {
+                await appendEvent(
+                  request.authUser,
+                  { entityType: "subscription", entityId: "pre-creation", action: "JurisdictionLimitExceeded", notes: `offering:${params.id} jurisdiction:${juris.code} amount:${payload.amount} max:${jurisMax}` },
+                  session,
+                );
+                throw new HttpError(
+                  422,
+                  `Maximum investment amount for ${juris.name} is ${jurisMax.toLocaleString()} ${juris.maxInvestmentCurrency || "NGN"}.`,
+                );
+              }
+            }
+
             // I-21: Enforce private/invitation-only offering whitelist
             if ((offering as any).isPrivate) {
               const whitelistIds = ((offering as any).investorWhitelistUserIds ?? []).map((id: any) => String(id));
               if (!whitelistIds.includes(String(request.authUser.userId))) {
                 throw new HttpError(403, "This is a private offering. You are not on the investor whitelist.");
               }
+            }
+
+            // §4: Cumulative oversubscription cap. The sum of all live subscriptions
+            // plus this one must not exceed the offering's raise capacity.
+            const raiseCapacity = toNumber((offering.terms as Record<string, unknown>).raiseAmount);
+            const liveStatuses = ["committed", "payment_pending", "paid", "allocation_confirmed"];
+            const [capAgg] = await SubscriptionModel.aggregate([
+              { $match: { offeringId: offering._id, status: { $in: liveStatuses } } },
+              { $group: { _id: null, total: { $sum: "$amount" } } },
+            ]).session(session);
+            const existingTotal = capAgg?.total ? toNumber(capAgg.total) : 0;
+            if (raiseCapacity > 0 && existingTotal + payload.amount > raiseCapacity) {
+              const remaining = Math.max(0, raiseCapacity - existingTotal);
+              throw new HttpError(
+                422,
+                `This subscription would oversubscribe the offering. Remaining capacity: ${remaining.toLocaleString()} NGN.`,
+              );
+            }
+
+            // §4: One active subscription per investor per offering. Prevents
+            // double-subscribe (e.g. double-click without an idempotency key).
+            const existingActive = await SubscriptionModel.findOne({
+              offeringId: offering._id,
+              investorUserId: request.authUser.userId,
+              status: { $in: liveStatuses },
+            })
+              .session(session)
+              .lean();
+            if (existingActive) {
+              throw new HttpError(409, "You already have an active subscription for this offering.");
             }
 
             assertTransition("subscription", "draft", "committed", {
@@ -176,6 +316,23 @@ export async function subscriptionRoutes(app: FastifyInstance) {
               ? new Date(Date.now() + coolingOffDays * 24 * 60 * 60 * 1000)
               : undefined;
 
+            // E-signature: bind the execution to who/what/when for a tamper-evident
+            // legal record (typed signature + document hash + IP + server-side hash).
+            const acceptedAt = new Date();
+            const executionHash = createHash("sha256")
+              .update(
+                JSON.stringify({
+                  offeringId: String(offering._id),
+                  investorUserId: String(request.authUser.userId),
+                  amount: payload.amount,
+                  signature: payload.agreement.signature,
+                  agreementVersion: payload.agreement.agreementVersion ?? null,
+                  documentHash: payload.agreement.documentHash ?? null,
+                  acceptedAt: acceptedAt.toISOString(),
+                }),
+              )
+              .digest("hex");
+
             const [subscription] = await SubscriptionModel.create(
               [
                 {
@@ -184,6 +341,14 @@ export async function subscriptionRoutes(app: FastifyInstance) {
                   amount: toDecimal(payload.amount),
                   status: "committed",
                   cancellableUntil,
+                  agreement: {
+                    signature: payload.agreement.signature,
+                    agreementVersion: payload.agreement.agreementVersion,
+                    documentHash: payload.agreement.documentHash,
+                    executionHash,
+                    acceptedAt,
+                    acceptedIp: request.ip,
+                  },
                 },
               ],
               { session },
@@ -228,7 +393,7 @@ export async function subscriptionRoutes(app: FastifyInstance) {
         .object({
           offeringId: z.string().optional(),
           status: z
-            .enum(["committed", "payment_pending", "paid", "allocation_pending", "allocation_confirmed", "redeemed", "cancelled", "refunded"])
+            .enum(["committed", "payment_pending", "paid", "allocation_pending", "allocation_confirmed", "refund_pending", "redeemed", "cancelled", "refunded"])
             .optional(),
           page: z.coerce.number().int().positive().default(1),
           limit: z.coerce.number().int().positive().max(100).default(20),
@@ -385,7 +550,7 @@ export async function subscriptionRoutes(app: FastifyInstance) {
               [
                 {
                   ledgerType: "escrow",
-                  accountRef: `offering:${String(subscription.offeringId)}`,
+                  accountRef: escrowAccountRef(subscription.offeringId),
                   direction: "credit",
                   amount: subscription.amount,
                   currency: payload.currency,
@@ -460,8 +625,17 @@ export async function subscriptionRoutes(app: FastifyInstance) {
 
       const params = z.object({ id: z.string() }).parse(request.params);
       const payload = z.object({ callbackUrl: z.string().url().optional() }).parse(request.body ?? {});
+      const commandId = readIdempotencyKey(request.headers);
 
-      return runInTransaction(async (session) => {
+      // §4: Wrap payment init in command idempotency so double-clicks collapse to
+      // one PaymentIntent + one Paystack call.
+      return runIdempotentCommand({
+        commandId,
+        userId: request.authUser.userId,
+        route: "POST:/v1/subscriptions/:id/initiate-payment",
+        payload: { id: params.id, callbackUrl: payload.callbackUrl },
+        execute: () =>
+          runInTransaction(async (session) => {
         const subscription = await SubscriptionModel.findById(params.id).session(session);
         if (!subscription) throw new HttpError(404, "Subscription not found");
         assertInvestorScope(request.authUser, String(subscription.investorUserId));
@@ -474,7 +648,9 @@ export async function subscriptionRoutes(app: FastifyInstance) {
         if (!user) throw new HttpError(404, "User not found");
 
         const amountNaira = Number(subscription.amount.toString());
-        const reference = subscription.paystackReference ?? `fractal_sub_${String(subscription._id)}_${Date.now()}`;
+        // §4: Deterministic reference (no Date.now()). Once set it is always reused,
+        // so concurrent first-clicks resolve to the same Paystack transaction.
+        const reference = subscription.paystackReference ?? `fractal_sub_${String(subscription._id)}`;
 
         const checkout = await initializePaystackTransaction({
           email: user.email,
@@ -494,6 +670,26 @@ export async function subscriptionRoutes(app: FastifyInstance) {
         }
         await subscription.save({ session });
 
+        // Create PaymentIntent — source of truth for expected amount
+        const amountKobo = Math.round(amountNaira * 100);
+        await PaymentIntentModel.findOneAndUpdate(
+          { subscriptionId: subscription._id, paystackReference: checkout.reference },
+          {
+            $setOnInsert: {
+              subscriptionId: subscription._id,
+              offeringId: subscription.offeringId,
+              investorUserId: subscription.investorUserId,
+              expectedAmountKobo: amountKobo,
+              currency: "NGN",
+              paystackReference: checkout.reference,
+              method: "checkout",
+              status: "pending",
+              expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+            },
+          },
+          { upsert: true, new: true, session },
+        );
+
         await appendEvent(
           request.authUser,
           {
@@ -510,6 +706,122 @@ export async function subscriptionRoutes(app: FastifyInstance) {
           paymentUrl: checkout.authorization_url,
           reference: checkout.reference,
           accessCode: checkout.access_code,
+        };
+          }),
+      });
+    },
+  );
+
+  // DVA-based payment: return virtual account details for bank transfer
+  app.post(
+    "/v1/subscriptions/:id/initiate-dva-payment",
+    { preHandler: [app.authenticate] },
+    async (request: FastifyRequest) => {
+      if (request.authUser.role !== "investor") throw new HttpError(403, "Investor role required");
+      if (!env.PAYSTACK_ENABLED) throw new HttpError(422, "Payment provider not configured");
+      if (!env.PAYSTACK_DVA_ENABLED) throw new HttpError(422, "DVA payments not enabled");
+
+      const params = z.object({ id: z.string() }).parse(request.params);
+
+      return runInTransaction(async (session) => {
+        const subscription = await SubscriptionModel.findById(params.id).session(session);
+        if (!subscription) throw new HttpError(404, "Subscription not found");
+        assertInvestorScope(request.authUser, String(subscription.investorUserId));
+
+        if (!["committed", "payment_pending"].includes(subscription.status)) {
+          throw new HttpError(422, "Subscription is not in a payable state");
+        }
+
+        const user = await UserModel.findById(request.authUser.userId).lean().session(session);
+        if (!user) throw new HttpError(404, "User not found");
+
+        // Find or create DVA for this investor
+        let dva = await DedicatedVirtualAccountModel.findOne({
+          investorUserId: request.authUser.userId,
+          active: true,
+        }).session(session);
+
+        if (!dva) {
+          // Create Paystack customer first
+          const nameParts = ((user as any).name ?? "Investor").split(" ");
+          const customer = await createPaystackCustomer({
+            email: (user as any).email,
+            firstName: nameParts[0] ?? "Investor",
+            lastName: nameParts.slice(1).join(" ") || "User",
+          });
+
+          const dvaResult = await createPaystackDedicatedVirtualAccount({
+            customerCode: customer.customer_code,
+            preferredBank: env.PAYSTACK_DVA_PREFERRED_BANK,
+          });
+
+          [dva] = await DedicatedVirtualAccountModel.create(
+            [
+              {
+                investorUserId: request.authUser.userId,
+                paystackCustomerCode: customer.customer_code,
+                bankName: dvaResult.bank.name,
+                bankCode: String(dvaResult.bank.id),
+                accountNumber: dvaResult.account_number,
+                accountName: dvaResult.account_name,
+                assignedAt: new Date(),
+                active: true,
+              },
+            ],
+            { session },
+          );
+        }
+
+        const amountNaira = Number(subscription.amount.toString());
+        const amountKobo = Math.round(amountNaira * 100);
+        // §4: Deterministic reference (no Date.now()) — the DVA PaymentIntent is
+        // matched by reference on the charge webhook.
+        const dvaReference = `fractal_dva_${String(subscription._id)}`;
+
+        // Create PaymentIntent for DVA payment
+        await PaymentIntentModel.findOneAndUpdate(
+          { subscriptionId: subscription._id, dvaAccountNumber: dva.accountNumber },
+          {
+            $setOnInsert: {
+              subscriptionId: subscription._id,
+              offeringId: subscription.offeringId,
+              investorUserId: subscription.investorUserId,
+              expectedAmountKobo: amountKobo,
+              currency: "NGN",
+              paystackReference: dvaReference,
+              dvaAccountNumber: dva.accountNumber,
+              method: "dva",
+              status: "pending",
+              expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000), // 72h for bank transfers
+            },
+          },
+          { upsert: true, new: true, session },
+        );
+
+        if (subscription.status === "committed") {
+          subscription.status = "payment_pending";
+          await subscription.save({ session });
+        }
+
+        await appendEvent(
+          request.authUser,
+          {
+            entityType: "subscription",
+            entityId: String(subscription._id),
+            action: "DVAPaymentInitiated",
+            notes: `account:${dva.accountNumber} bank:${dva.bankName}`,
+          },
+          session,
+        );
+
+        return {
+          subscriptionId: String(subscription._id),
+          bankName: dva.bankName,
+          accountNumber: dva.accountNumber,
+          accountName: dva.accountName,
+          amount: amountNaira,
+          currency: "NGN",
+          instructions: `Transfer exactly ₦${amountNaira.toLocaleString()} to the account above. Your subscription will be confirmed automatically once the transfer is received.`,
         };
       });
     },
@@ -544,20 +856,116 @@ export async function subscriptionRoutes(app: FastifyInstance) {
               assertIssuerBusinessScope(request.authUser, String(offering.businessId));
             }
 
-            assertTransition("subscription", subscription.status as any, "cancelled");
-
-            // I-50: After cooling-off period expires, paid subscriptions cannot be self-cancelled by investors
+            // I-50: Paid subscription cooling-off cancellation → auto-refund
             if (
               request.authUser.role === "investor" &&
-              subscription.status === "paid" &&
-              (subscription as any).cancellableUntil &&
-              new Date() > new Date((subscription as any).cancellableUntil)
+              (subscription.status === "paid" || subscription.status === "allocation_confirmed")
             ) {
+              const cancellableUntil = (subscription as any).cancellableUntil;
+              if (!cancellableUntil || new Date() > new Date(cancellableUntil)) {
+                throw new HttpError(
+                  422,
+                  "The cooling-off period for this subscription has expired. Contact the platform operator to arrange a cancellation.",
+                );
+              }
+
+              // Within cooling-off: auto-initiate refund instead of cancel
+              if (env.PAYSTACK_ENABLED && subscription.externalReceiptRef) {
+                const amountNaira = Number(subscription.amount.toString());
+                const refundRef = `cooling-off-refund:${String(subscription._id)}:${Date.now()}`;
+
+                const refundResult = await initiatePaystackRefund({
+                  transactionReference: subscription.externalReceiptRef,
+                  amountKobo: nairaToKobo(amountNaira),
+                  merchantNote: `Cooling-off cancellation: ${payload.reason ?? "Investor cancelled within cooling-off period"}`,
+                });
+
+                await OutboundTransferModel.create(
+                  [
+                    {
+                      transferCode: `refund_${refundResult.id}`,
+                      reference: refundRef,
+                      recipientCode: "refund",
+                      amountKobo: nairaToKobo(amountNaira),
+                      currency: "NGN",
+                      reason: payload.reason ?? "Cooling-off cancellation",
+                      status: "pending",
+                      entityType: "refund",
+                      entityId: String(subscription._id),
+                      metadata: { paystackRefundId: refundResult.id, coolingOff: true },
+                    },
+                  ],
+                  { session },
+                );
+
+                subscription.status = "refund_pending";
+                await subscription.save({ session });
+
+                await recalcOfferingMetrics(String(subscription.offeringId), session);
+
+                await appendEvent(
+                  request.authUser,
+                  {
+                    entityType: "subscription",
+                    entityId: String(subscription._id),
+                    action: "CoolingOffRefundInitiated",
+                    notes: `paystack_refund:${refundResult.id} reason:${payload.reason ?? "cooling-off"}`,
+                  },
+                  session,
+                );
+
+                await createNotificationsFromEvent(
+                  request.authUser,
+                  {
+                    entityType: "subscription",
+                    entityId: String(subscription._id),
+                    action: "CoolingOffRefundInitiated",
+                    notes: `investorUserId:${String(subscription.investorUserId)} amount:${amountNaira}`,
+                  },
+                  session,
+                );
+
+                // Reverse platform fee
+                const feeEntry = await LedgerEntryModel.findOne({
+                  ledgerType: "fee",
+                  accountRef: "platform:fees",
+                  entityType: "subscription",
+                  entityId: String(subscription._id),
+                  direction: "credit",
+                }).session(session);
+
+                if (feeEntry) {
+                  await LedgerEntryModel.create(
+                    [
+                      {
+                        ledgerType: "fee",
+                        accountRef: "platform:fees",
+                        direction: "debit",
+                        amount: feeEntry.amount,
+                        currency: feeEntry.currency ?? "NGN",
+                        entityType: "subscription",
+                        entityId: String(subscription._id),
+                        externalRef: refundRef,
+                        idempotencyKey: `${commandId ?? refundRef}:fee-reversal`,
+                        postedAt: new Date(),
+                        metadata: { feeType: "platform_fee_reversal", reason: "cooling_off_cancellation" },
+                      },
+                    ],
+                    { session },
+                  );
+                }
+
+                return serialize(subscription.toObject());
+              }
+
+              // No Paystack — operator must handle the refund manually
               throw new HttpError(
                 422,
-                "The cooling-off period for this subscription has expired. Contact the platform operator to arrange a cancellation.",
+                "Paid subscription cancellation requires a refund. Contact the platform operator.",
               );
             }
+
+            assertTransition("subscription", subscription.status as any, "cancelled");
 
             subscription.status = "cancelled";
             await subscription.save({ session });
@@ -571,6 +979,17 @@ export async function subscriptionRoutes(app: FastifyInstance) {
                 entityId: String(subscription._id),
                 action: "SubscriptionCancelled",
                 notes: payload.reason,
+              },
+              session,
+            );
+
+            await createNotificationsFromEvent(
+              request.authUser,
+              {
+                entityType: "subscription",
+                entityId: String(subscription._id),
+                action: "SubscriptionCancelled",
+                notes: `investorUserId:${String(subscription.investorUserId)}`,
               },
               session,
             );
@@ -593,7 +1012,7 @@ export async function subscriptionRoutes(app: FastifyInstance) {
       const payload = z
         .object({
           reason: z.string().min(3),
-          reversalRef: z.string().min(6),
+          reversalRef: z.string().min(6).optional(),
           confirm: z.literal("REFUND"),
         })
         .parse(request.body);
@@ -609,6 +1028,102 @@ export async function subscriptionRoutes(app: FastifyInstance) {
             const subscription = await SubscriptionModel.findById(params.id).session(session);
             if (!subscription) throw new HttpError(404, "Subscription not found");
 
+            // When Paystack is enabled, use refund_pending → webhook confirms.
+            // When disabled, go directly to refunded (manual off-platform refund).
+            if (env.PAYSTACK_ENABLED && subscription.externalReceiptRef) {
+              assertTransition("subscription", subscription.status as any, "refund_pending");
+
+              const amountNaira = Number(subscription.amount.toString());
+              const refundRef = `refund:${String(subscription._id)}:${Date.now()}`;
+
+              const refundResult = await initiatePaystackRefund({
+                transactionReference: subscription.externalReceiptRef,
+                amountKobo: nairaToKobo(amountNaira),
+                merchantNote: payload.reason,
+              });
+
+              // Track outbound refund transfer
+              await OutboundTransferModel.create(
+                [
+                  {
+                    transferCode: `refund_${refundResult.id}`,
+                    reference: refundRef,
+                    recipientCode: "refund",
+                    amountKobo: nairaToKobo(amountNaira),
+                    currency: "NGN",
+                    reason: payload.reason,
+                    status: "pending",
+                    entityType: "refund",
+                    entityId: String(subscription._id),
+                    metadata: { paystackRefundId: refundResult.id },
+                  },
+                ],
+                { session },
+              );
+
+              subscription.status = "refund_pending";
+              await subscription.save({ session });
+
+              await appendEvent(
+                request.authUser,
+                {
+                  entityType: "subscription",
+                  entityId: String(subscription._id),
+                  action: "RefundInitiated",
+                  notes: `paystack_refund:${refundResult.id} reason:${payload.reason}`,
+                },
+                session,
+              );
+
+              await createNotificationsFromEvent(
+                request.authUser,
+                {
+                  entityType: "subscription",
+                  entityId: String(subscription._id),
+                  action: "RefundInitiated",
+                  notes: `investorUserId:${String(subscription.investorUserId)} amount:${amountNaira}`,
+                },
+                session,
+              );
+
+              // Reverse platform fee that was charged on this subscription's payment
+              const feeEntry = await LedgerEntryModel.findOne({
+                ledgerType: "fee",
+                accountRef: "platform:fees",
+                entityType: "subscription",
+                entityId: String(subscription._id),
+                direction: "credit",
+              }).session(session);
+
+              if (feeEntry) {
+                await LedgerEntryModel.create(
+                  [
+                    {
+                      ledgerType: "fee",
+                      accountRef: "platform:fees",
+                      direction: "debit",
+                      amount: feeEntry.amount,
+                      currency: feeEntry.currency ?? "NGN",
+                      entityType: "subscription",
+                      entityId: String(subscription._id),
+                      externalRef: refundRef,
+                      idempotencyKey: `${commandId ?? refundRef}:fee-reversal`,
+                      postedAt: new Date(),
+                      metadata: { feeType: "platform_fee_reversal", reason: payload.reason },
+                    },
+                  ],
+                  { session },
+                );
+              }
+
+              return serialize(subscription.toObject());
+            }
+
+            // Manual refund path (Paystack disabled or no external receipt)
+            if (!payload.reversalRef) {
+              throw new HttpError(422, "reversalRef is required for manual refunds");
+            }
+
             assertTransition("subscription", subscription.status as any, "refunded", {
               hasReversalRecord: true,
               approvalPolicySatisfied: true,
@@ -621,7 +1136,7 @@ export async function subscriptionRoutes(app: FastifyInstance) {
               [
                 {
                   ledgerType: "escrow",
-                  accountRef: `offering:${String(subscription.offeringId)}`,
+                  accountRef: escrowAccountRef(subscription.offeringId),
                   direction: "debit",
                   amount: subscription.amount,
                   currency: "NGN",
@@ -652,8 +1167,93 @@ export async function subscriptionRoutes(app: FastifyInstance) {
               session,
             );
 
+            await createNotificationsFromEvent(
+              request.authUser,
+              {
+                entityType: "subscription",
+                entityId: String(subscription._id),
+                action: "SubscriptionRefunded",
+                notes: `investorUserId:${String(subscription.investorUserId)} amount:${Number(subscription.amount.toString())}`,
+              },
+              session,
+            );
+
+            // Reverse platform fee that was charged on this subscription's payment
+            const feeEntry = await LedgerEntryModel.findOne({
+              ledgerType: "fee",
+              accountRef: "platform:fees",
+              entityType: "subscription",
+              entityId: String(subscription._id),
+              direction: "credit",
+            }).session(session);
+
+            if (feeEntry) {
+              await LedgerEntryModel.create(
+                [
+                  {
+                    ledgerType: "fee",
+                    accountRef: "platform:fees",
+                    direction: "debit",
+                    amount: feeEntry.amount,
+                    currency: feeEntry.currency ?? "NGN",
+                    entityType: "subscription",
+                    entityId: String(subscription._id),
+                    externalRef: payload.reversalRef,
+                    idempotencyKey: `${commandId ?? payload.reversalRef}:fee-reversal`,
+                    postedAt: new Date(),
+                    metadata: { feeType: "platform_fee_reversal", reason: payload.reason },
+                  },
+                ],
+                { session },
+              );
+            }
+
             return serialize(subscription.toObject());
           }),
+      });
+    },
+  );
+
+  // 3.1: Payment status endpoint — used by frontend to poll after Paystack redirect
+  app.get(
+    "/v1/subscriptions/:id/payment-status",
+    { preHandler: [app.authenticate] },
+    async (request: FastifyRequest) => {
+      const params = z.object({ id: z.string() }).parse(request.params);
+
+      const subscription = await SubscriptionModel.findById(params.id).lean();
+      if (!subscription) throw new HttpError(404, "Subscription not found");
+
+      // Investors can only check their own subscription; operators/admins can check any
+      if (request.authUser.role === "investor") {
+        assertInvestorScope(request.authUser, String((subscription as any).investorUserId));
+      }
+
+      // Find the latest PaymentIntent for this subscription
+      const intent = await PaymentIntentModel.findOne({
+        subscriptionId: (subscription as any)._id,
+      })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      return serialize({
+        subscriptionId: String((subscription as any)._id),
+        offeringId: String((subscription as any).offeringId),
+        status: (subscription as any).status,
+        paystackReference: (subscription as any).paystackReference ?? null,
+        paidAt: (subscription as any).updatedAt && (subscription as any).status === "paid"
+          ? (subscription as any).updatedAt
+          : null,
+        paymentIntent: intent
+          ? {
+              status: (intent as any).status,
+              method: (intent as any).method,
+              expectedAmountKobo: (intent as any).expectedAmountKobo,
+              receivedAmountKobo: (intent as any).receivedAmountKobo ?? null,
+              matchedAt: (intent as any).matchedAt ?? null,
+              expiresAt: (intent as any).expiresAt,
+            }
+          : null,
       });
     },
   );

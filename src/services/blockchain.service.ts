@@ -10,12 +10,14 @@ import {
   createPublicClient,
   createWalletClient,
   http,
+  nonceManager,
   type PublicClient,
   type WalletClient,
   type Hash,
   type Abi,
+  zeroAddress,
 } from "viem";
-import { polygon, polygonAmoy } from "viem/chains";
+import { polygon, polygonAmoy, sepolia } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
 import { env } from "../config/env.js";
 import { keyManager } from "./key-manager.js";
@@ -23,6 +25,20 @@ import { keyManager } from "./key-manager.js";
 // ── Minimal ABIs (only the functions we call) ─────────────────────────────────
 
 const TOKEN_FACTORY_ABI = [
+  {
+    name: "owner",
+    type: "function",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }],
+  },
+  {
+    name: "supportsImmutableIssuanceCap",
+    type: "function",
+    stateMutability: "pure",
+    inputs: [],
+    outputs: [{ name: "", type: "bool" }],
+  },
   {
     name: "deployToken",
     type: "function",
@@ -34,6 +50,7 @@ const TOKEN_FACTORY_ABI = [
       { name: "tokenSymbol",         type: "string"  },
       { name: "maxBalancePerHolder", type: "uint256" },
       { name: "retailCap",           type: "uint256" },
+      { name: "maxTotalSupply",      type: "uint256" },
     ],
     outputs: [
       { name: "tokenAddr", type: "address" },
@@ -311,11 +328,15 @@ const IDENTITY_REGISTRY_ABI = [
 // ── Client initialization ──────────────────────────────────────────────────────
 
 function getChain() {
-  return env.CHAIN_ID === 137 ? polygon : polygonAmoy;
+  if (env.CHAIN_ID === 137) return polygon;
+  if (env.CHAIN_ID === 11155111) return sepolia;
+  return polygonAmoy;
 }
 
 function getRpcUrl() {
-  return env.CHAIN_ID === 137 ? env.POLYGON_RPC_URL : env.POLYGON_AMOY_RPC_URL;
+  if (env.CHAIN_ID === 137) return env.POLYGON_RPC_URL;
+  if (env.CHAIN_ID === 11155111) return env.SEPOLIA_RPC_URL;
+  return env.POLYGON_AMOY_RPC_URL;
 }
 
 let _publicClient: PublicClient | null = null;
@@ -334,7 +355,12 @@ export function getPublicClient(): PublicClient {
 export async function getWalletClient(): Promise<WalletClient> {
   if (!_walletClient) {
     const privateKey = await keyManager.getPrivateKey("fractal_agent");
-    const account = privateKeyToAccount(privateKey);
+    // nonceManager serializes nonce allocation for the shared operator wallet so
+    // concurrent on-chain ops do not collide on the same nonce.
+    const account = privateKeyToAccount(privateKey, { nonceManager });
+    if (env.FRACTAL_AGENT_ADDRESS && account.address.toLowerCase() !== env.FRACTAL_AGENT_ADDRESS.toLowerCase()) {
+      throw new Error("FRACTAL_AGENT_ADDRESS does not match the configured operator private key");
+    }
     _walletClient = createWalletClient({
       account,
       chain: getChain(),
@@ -351,8 +377,9 @@ export interface DeployTokenParams {
   offeringName: string;
   tokenName: string;
   tokenSymbol: string;
-  maxBalancePerHolder?: number;
-  retailCap?: number;
+  maxBalancePerHolder?: bigint | number;
+  retailCap?: bigint | number;
+  maxTotalSupply: bigint | number;
 }
 
 export async function deployToken(params: DeployTokenParams): Promise<Hash> {
@@ -374,6 +401,7 @@ export async function deployToken(params: DeployTokenParams): Promise<Hash> {
       params.tokenSymbol,
       BigInt(params.maxBalancePerHolder ?? 0),
       BigInt(params.retailCap ?? 0),
+      BigInt(params.maxTotalSupply),
     ],
     account,
     chain: getChain(),
@@ -381,9 +409,60 @@ export async function deployToken(params: DeployTokenParams): Promise<Hash> {
   return hash;
 }
 
+/** Refuse an issuance when the configured signer no longer owns the factory. */
+export async function assertTokenFactoryOwner(): Promise<void> {
+  if (!env.TOKEN_FACTORY_ADDRESS) throw new Error("TOKEN_FACTORY_ADDRESS not configured");
+  const walletClient = await getWalletClient();
+  const account = walletClient.account;
+  if (!account) throw new Error("No account on wallet client");
+  const owner = await getPublicClient().readContract({
+    address: env.TOKEN_FACTORY_ADDRESS as `0x${string}`,
+    abi: TOKEN_FACTORY_ABI,
+    functionName: "owner",
+  }) as `0x${string}`;
+  if (owner.toLowerCase() !== account.address.toLowerCase()) {
+    throw new Error(`Configured operator does not own TOKEN_FACTORY_ADDRESS (owner ${owner})`);
+  }
+}
+
+/** Reject legacy factories whose deployed tokens can be issued without a total cap. */
+export async function assertTokenFactorySupportsImmutableIssuanceCap(): Promise<void> {
+  if (!env.TOKEN_FACTORY_ADDRESS) throw new Error("TOKEN_FACTORY_ADDRESS not configured");
+  const supported = await getPublicClient().readContract({
+    address: env.TOKEN_FACTORY_ADDRESS as `0x${string}`,
+    abi: TOKEN_FACTORY_ABI,
+    functionName: "supportsImmutableIssuanceCap",
+  });
+  if (!supported) throw new Error("Configured TokenFactory does not enforce immutable issuance caps");
+}
+
+/**
+ * Resolve a factory deployment after its creation transaction is confirmed.
+ * The transaction receipt only proves the factory call succeeded; this read
+ * proves which security-token address the factory recorded for the offering.
+ */
+export async function getDeployedToken(
+  offeringId: string,
+): Promise<{ tokenContract: `0x${string}`; offeringId: string; deployedAt: bigint }> {
+  if (!env.TOKEN_FACTORY_ADDRESS) {
+    throw new Error("TOKEN_FACTORY_ADDRESS not configured");
+  }
+  const record = (await getPublicClient().readContract({
+    address: env.TOKEN_FACTORY_ADDRESS as `0x${string}`,
+    abi: TOKEN_FACTORY_ABI,
+    functionName: "getDeployedToken",
+    args: [offeringId],
+  })) as { tokenContract: `0x${string}`; offeringId: string; deployedAt: bigint };
+
+  if (record.tokenContract === zeroAddress || record.offeringId !== offeringId || record.deployedAt === 0n) {
+    throw new Error(`TokenFactory has no confirmed deployment record for offering ${offeringId}`);
+  }
+  return record;
+}
+
 export interface BatchMintEntry {
   wallet: `0x${string}`;
-  tokenAmount: number;
+  tokenAmount: bigint;
   subscriptionId: string;
 }
 
@@ -402,7 +481,7 @@ export async function batchMint(
     functionName: "batchMint",
     args: [
       entries.map((e) => e.wallet),
-      entries.map((e) => BigInt(e.tokenAmount)),
+      entries.map((e) => e.tokenAmount),
       entries.map((e) => e.subscriptionId),
       tokenId,
     ],

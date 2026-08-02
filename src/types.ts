@@ -5,6 +5,7 @@ export interface AuthUser {
   userId: string;
   role: Role;
   businessId?: string;
+  sessionId?: string;
 }
 
 export type MaybeObjectId = string | Types.ObjectId;

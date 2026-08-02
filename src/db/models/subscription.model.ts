@@ -30,6 +30,15 @@ const subscriptionSchema = new Schema(
     // I-50: Investor cooling-off period — subscription is cancellable without penalty until this date
     cancellableUntil: { type: Date },
     allocationConfirmedAt: { type: Date },
+    // E-signature: the executed subscription agreement (legal record of consent).
+    agreement: {
+      signature: { type: String }, // typed full name (the e-signature)
+      agreementVersion: { type: String },
+      documentHash: { type: String }, // sha256 of the agreement document the investor accepted
+      executionHash: { type: String }, // server-bound hash of the execution context
+      acceptedAt: { type: Date },
+      acceptedIp: { type: String },
+    },
   },
   { ...timestamped, collection: "subscriptions" },
 );

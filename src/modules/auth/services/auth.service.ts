@@ -1,28 +1,87 @@
 import bcrypt from "bcrypt";
-import type { FastifyInstance } from "fastify";
 import {
   InvestorProfileModel,
   ProfessionalModel,
   UserModel,
 } from "../../../db/models.js";
 import { HttpError } from "../../../utils/errors.js";
+import { env } from "../../../config/env.js";
+import { projectLegacyIdentity, PostgresIdentityProjectionError } from "../../../platform/postgres-identities.js";
+import {
+  createPostgresAuthIdentity,
+  getPostgresAuthIdentityByEmail,
+  getPostgresAuthIdentityById,
+  PostgresAuthIdentityConflictError,
+  type PostgresAuthIdentity,
+} from "../../../platform/postgres-identities.js";
+import { sendEmailVerification } from "./account-security.service.js";
 import type {
   AuthLoginPayload,
   AuthRegisterPayload,
   AuthSyncPayload,
 } from "../schemas/auth.schemas.js";
+import { PlatformContentError } from "../../../platform/postgres-platform-content.js";
 
 type AuthRecord = {
-  _id: { toString: () => string };
+  _id: { toString: () => string } | string;
   role: string;
   businessId?: { toString: () => string };
   professionalId?: { toString: () => string };
   investorProfileId?: { toString: () => string };
   status?: string;
+  email?: string;
+  name?: string;
+  passwordHash?: string;
+  emailVerified?: boolean;
+  tokenInvalidatedAt?: Date;
+  createdAt?: Date;
+  updatedAt?: Date;
   [key: string]: unknown;
 };
 
 const SELF_SERVE_ROLES = new Set(["issuer", "investor", "professional"]);
+
+function rethrowRegistrationContentError(error: unknown): never {
+  if (error instanceof PlatformContentError) {
+    throw new HttpError(error.code === "unavailable" ? 503 : error.code === "stale_version" ? 409 : 400, error.message);
+  }
+  throw error;
+}
+
+function authRecordId(user: AuthRecord): string {
+  return typeof user._id === "string" ? user._id : user._id.toString();
+}
+
+function asPostgresAuthRecord(identity: PostgresAuthIdentity): AuthRecord {
+  return {
+    _id: identity.id,
+    role: identity.role,
+    status: identity.status,
+    email: identity.email,
+    name: identity.legalName,
+    passwordHash: identity.passwordHash ?? undefined,
+    emailVerified: identity.emailVerifiedAt !== null,
+    tokenInvalidatedAt: identity.credentialInvalidatedAt ?? undefined,
+    createdAt: identity.createdAt,
+    updatedAt: identity.updatedAt,
+  };
+}
+
+async function ensurePostgresIdentity(user: AuthRecord, legal?: { acceptances: AuthRegisterPayload["legalAcceptances"]; metadata: { ip?: string; userAgent?: string } }): Promise<AuthRecord> {
+  try {
+    await projectLegacyIdentity({
+      legacyMongoId: authRecordId(user), email: String(user.email ?? ""), legalName: String(user.name ?? ""),
+      role: user.role, status: user.status === "disabled" ? "disabled" : "active", passwordHash: user.passwordHash ?? null,
+      emailVerified: user.emailVerified === true, credentialInvalidatedAt: user.tokenInvalidatedAt ?? null,
+      createdAt: user.createdAt ?? null, updatedAt: user.updatedAt ?? null,
+      legalAcceptances: legal?.acceptances, acceptanceMetadata: legal?.metadata,
+    });
+    return user;
+  } catch (error) {
+    if (error instanceof PostgresIdentityProjectionError) throw new HttpError(503, "Account identity provisioning is unavailable. Please try again.");
+    throw error;
+  }
+}
 
 function isPrivilegedRole(role: string): boolean {
   return role === "admin" || role === "operator";
@@ -67,6 +126,16 @@ async function ensureInvestorProfileForUser(
 export async function authenticateByPassword(
   payload: AuthLoginPayload,
 ): Promise<AuthRecord> {
+  if (env.AUTH_IDENTITY_AUTHORITY === "postgres") {
+    const identity = await getPostgresAuthIdentityByEmail(payload.email);
+    if (!identity || identity.status === "disabled") throw new HttpError(401, "Invalid credentials");
+    if (!identity.passwordHash || !(await bcrypt.compare(payload.password, identity.passwordHash))) {
+      throw new HttpError(401, "Invalid credentials");
+    }
+    if (!identity.emailVerifiedAt) throw new HttpError(403, "Verify your email address before signing in");
+    return asPostgresAuthRecord(identity);
+  }
+
   const user = await UserModel.findOne({ email: payload.email.toLowerCase() }).lean();
   if (!user) throw new HttpError(401, "Invalid credentials");
   if (user.status === "disabled") throw new HttpError(403, "User disabled");
@@ -81,14 +150,46 @@ export async function authenticateByPassword(
 
   const valid = await bcrypt.compare(payload.password, passwordHash);
   if (!valid) throw new HttpError(401, "Invalid credentials");
+  if (!user.emailVerified) {
+    throw new HttpError(403, "Verify your email address before signing in");
+  }
 
-  return user as AuthRecord;
+  return ensurePostgresIdentity(user as AuthRecord);
 }
 
 export async function registerAuthUser(
   payload: AuthRegisterPayload,
+  metadata: { ip?: string; userAgent?: string },
 ): Promise<AuthRecord> {
   const email = payload.email.toLowerCase();
+  const legalAcceptances = env.NODE_ENV === "development" ? undefined : payload.legalAcceptances;
+  if (env.AUTH_IDENTITY_AUTHORITY === "postgres") {
+    const passwordHash = await bcrypt.hash(payload.password, 12);
+    try {
+      const identity = await createPostgresAuthIdentity({
+        email,
+        legalName: payload.name,
+        role: payload.role,
+        passwordHash,
+        legalAcceptances,
+        acceptanceMetadata: metadata,
+      });
+      const user = asPostgresAuthRecord(identity);
+      // The identity transaction also creates a durable verification-email
+      // command. It contains no bearer token; the worker creates one only
+      // immediately before delivery.
+      return user;
+    } catch (error) {
+      if (error instanceof PostgresAuthIdentityConflictError) {
+        throw new HttpError(409, "An account with this email already exists");
+      }
+      if (error instanceof PostgresIdentityProjectionError) {
+        throw new HttpError(503, "Account identity provisioning is unavailable. Please try again.");
+      }
+      rethrowRegistrationContentError(error);
+    }
+  }
+
   const existing = await UserModel.findOne({ email }).lean();
   if (existing) {
     throw new HttpError(409, "An account with this email already exists");
@@ -104,6 +205,14 @@ export async function registerAuthUser(
   });
 
   let user = created.toObject() as AuthRecord;
+  try {
+    await ensurePostgresIdentity(user, legalAcceptances ? { acceptances: legalAcceptances, metadata } : undefined);
+  } catch (error) {
+    // No durable session or profile exists yet. Remove the just-created legacy
+    // row so a retried registration is not stranded behind a half-account.
+    await UserModel.findByIdAndDelete(user._id).catch(() => undefined);
+    rethrowRegistrationContentError(error);
+  }
   if (payload.role === "investor") {
     user = await ensureInvestorProfileForUser(user);
   }
@@ -139,10 +248,20 @@ export async function registerAuthUser(
     user = updatedUser as AuthRecord;
   }
 
+  // The legacy bridge retains its current non-blocking delivery behaviour.
+  void sendEmailVerification(String(user._id)).catch(() => {});
+
   return user;
 }
 
 export async function syncAuthUser(payload: AuthSyncPayload): Promise<AuthRecord> {
+  if (env.AUTH_IDENTITY_AUTHORITY === "postgres") {
+    // The native UI uses password registration. Do not allow this legacy
+    // synchronization endpoint to become a second identity writer after the
+    // cutover merely because it still exists for migration environments.
+    throw new HttpError(410, "External identity synchronization is not available for the PostgreSQL identity authority.");
+  }
+
   const email = payload.email.toLowerCase();
   let user = await UserModel.findOne({ email }).lean();
 
@@ -161,7 +280,13 @@ export async function syncAuthUser(payload: AuthSyncPayload): Promise<AuthRecord
       status: "active",
     });
     user = created.toObject();
-    return ensureInvestorProfileForUser(user as AuthRecord);
+    try {
+      await ensurePostgresIdentity(user as AuthRecord);
+    } catch (error) {
+      await UserModel.findByIdAndDelete(created._id).catch(() => undefined);
+      throw error;
+    }
+    return ensurePostgresIdentity(await ensureInvestorProfileForUser(user as AuthRecord));
   }
 
   if (user.status === "disabled") {
@@ -171,7 +296,7 @@ export async function syncAuthUser(payload: AuthSyncPayload): Promise<AuthRecord
   if (payload.role && user.role !== payload.role) {
     if (isPrivilegedRole(user.role)) {
       // A-75: Privileged roles cannot be changed via sync — return existing record
-      return user as AuthRecord;
+      return ensurePostgresIdentity(user as AuthRecord);
     }
 
     if (SELF_SERVE_ROLES.has(user.role)) {
@@ -206,25 +331,20 @@ export async function syncAuthUser(payload: AuthSyncPayload): Promise<AuthRecord
       ).lean();
 
       if (!updated) throw new HttpError(404, "User not found");
-      return ensureInvestorProfileForUser(updated as AuthRecord);
+      return ensurePostgresIdentity(await ensureInvestorProfileForUser(updated as AuthRecord));
     }
   }
 
-  return ensureInvestorProfileForUser(user as AuthRecord);
-}
-
-export async function issueAuthToken(
-  app: FastifyInstance,
-  user: AuthRecord,
-): Promise<string> {
-  return app.jwt.sign({
-    userId: user._id.toString(),
-    role: user.role,
-    businessId: user.businessId?.toString(),
-  });
+  return ensurePostgresIdentity(await ensureInvestorProfileForUser(user as AuthRecord));
 }
 
 export async function getAuthUserById(userId: string): Promise<AuthRecord> {
+  if (env.AUTH_IDENTITY_AUTHORITY === "postgres") {
+    const identity = await getPostgresAuthIdentityById(userId);
+    if (!identity) throw new HttpError(404, "User not found");
+    return asPostgresAuthRecord(identity);
+  }
+
   const user = await UserModel.findById(userId).lean();
   if (!user) throw new HttpError(404, "User not found");
   return user as AuthRecord;

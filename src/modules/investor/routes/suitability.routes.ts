@@ -6,6 +6,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { SuitabilityAssessmentModel } from "../../../db/models.js";
 import { HttpError } from "../../../utils/errors.js";
+import { appendEvent } from "../../../utils/audit.js";
 import { serialize } from "../../../utils/serialize.js";
 
 const ASSESSMENT_VALIDITY_MONTHS = 12;
@@ -50,6 +51,13 @@ export async function suitabilityRoutes(app: FastifyInstance) {
         riskTier: tier,
         completedAt: new Date(),
         expiresAt,
+      });
+
+      await appendEvent(request.authUser, {
+        entityType: "user",
+        entityId: String(request.authUser.userId),
+        action: "SuitabilityAssessmentCompleted",
+        notes: `riskTier:${tier} riskScore:${score}`,
       });
 
       return serialize(assessment.toObject());

@@ -18,7 +18,7 @@ const investorProfileSchema = new Schema(
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true },
     kycStatus: {
       type: String,
-      enum: ["draft", "submitted", "in_review", "approved", "rejected"],
+      enum: ["draft", "submitted", "in_review", "approved", "rejected", "renewal_required"],
       default: "draft",
       index: true,
     },
@@ -76,6 +76,11 @@ const investorProfileSchema = new Schema(
     sumsubReviewAnswer: { type: String, enum: ["GREEN", "RED", null] },
     sumsubRejectLabels: [{ type: String }],
     sumsubReviewedAt: { type: Date },
+    // On-chain wallet linkage (Privy embedded wallet) — drives chain auto-wiring.
+    privyUserId: { type: String, index: true, sparse: true },
+    walletAddress: { type: String, index: true, sparse: true },
+    // GDPR: set when PII has been anonymized via a fulfilled deletion request.
+    anonymizedAt: { type: Date },
   },
   { ...timestamped, collection: "investorProfiles" },
 );

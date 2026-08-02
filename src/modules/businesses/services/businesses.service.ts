@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import type { AuthUser } from "../../../types.js";
 import { BusinessModel, UserModel } from "../../../db/models.js";
 import { appendEvent } from "../../../utils/audit.js";
+import { runInTransaction } from "../../../utils/tx.js";
 import { HttpError } from "../../../utils/errors.js";
 import { persistBusinessBinary, retrieveFile } from "../../../services/storage.js";
 import { createNotificationsFromEvent } from "../../../services/notifications.js";
@@ -9,6 +10,7 @@ import { assertIssuerBusinessScope } from "../../../utils/scope.js";
 import { env } from "../../../config/env.js";
 import { resolvePaystackAccount } from "../../../services/paystack.js";
 import type { SuspensionReason } from "../../../utils/constants.js";
+import { validateUboCoverage } from "../../../utils/ubo-validation.js";
 import type {
   BusinessDocumentUploadPayload,
   BusinessKybReviewPayload,
@@ -134,8 +136,12 @@ export async function registerIssuerBusiness(
       ? new Date(payload.incorporationDate)
       : undefined;
 
+  // Wrap the multi-document writes (business + user + audit event) in one
+  // transaction so a mid-flight crash cannot orphan a business without its owner.
+  await runInTransaction(async (session) => {
   if (!business) {
-    business = await BusinessModel.create({
+    [business] = await BusinessModel.create(
+      [{
       name: payload.legalName,
       type: mappedType,
       kybStatus: "draft",
@@ -169,7 +175,9 @@ export async function registerIssuerBusiness(
         },
       },
       documents: [],
-    });
+      }],
+      { session },
+    );
   } else {
     assertIssuerBusinessScope(authUser, String(business._id));
     business.name = payload.legalName;
@@ -211,29 +219,38 @@ export async function registerIssuerBusiness(
       business.kybReviewedBy = undefined;
     }
 
-    await business.save();
+    await business.save({ session });
   }
 
   if (!user.businessId || String(user.businessId) !== String(business._id)) {
     user.businessId = business._id as any;
     (user as any).businessRole = "owner";
-    await user.save();
+    await user.save({ session });
   } else if (!(user as any).businessRole) {
     (user as any).businessRole = "owner";
-    await user.save();
+    await user.save({ session });
   }
 
-  await appendEvent(authUser, {
-    entityType: "business",
-    entityId: String(business._id),
-    action: "Issuer business registration saved",
+  await appendEvent(
+    authUser,
+    {
+      entityType: "business",
+      entityId: String(business._id),
+      action: "Issuer business registration saved",
+    },
+    session,
+  );
   });
 
-  const token = await app.jwt.sign({
-    userId: user._id.toString(),
-    role: user.role,
-    businessId: String(business._id),
-  });
+  // 3.7: explicit expiry so the issued session token cannot live forever.
+  const token = await app.jwt.sign(
+    {
+      userId: user._id.toString(),
+      role: user.role,
+      businessId: String(business._id),
+    },
+    { expiresIn: "8h" },
+  );
 
   return {
     token,
@@ -265,6 +282,12 @@ export async function submitIssuerBusinessKyb(authUser: AuthUser) {
       422,
       "At least one Ultimate Beneficial Owner (UBO) must be declared before KYB submission (CAMA 2020 requirement)",
     );
+  }
+
+  // C7: Validate beneficial ownership coverage (>25% owners fully disclosed, >=75% total)
+  const uboResult = validateUboCoverage(ubos);
+  if (!uboResult.valid) {
+    throw new HttpError(422, `UBO validation failed: ${uboResult.errors.join("; ")}`);
   }
 
   // I-02: Require at least two directors (or one for sole trader)

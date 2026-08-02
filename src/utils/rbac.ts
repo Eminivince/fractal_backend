@@ -30,7 +30,10 @@ export type ResourceKind =
   | "notification"
   | "anchor"
   | "ledger"
-  | "reconciliation";
+  | "reconciliation"
+  | "compliance_report"
+  | "developer"
+  | "transfer";
 
 export type Action = "create" | "read" | "update" | "review" | "approve" | "execute" | "submit";
 
@@ -57,6 +60,9 @@ const rolePolicies: Record<Role, Record<ResourceKind, Action[]>> = {
     anchor: ["read", "execute"],
     ledger: ["read"],
     reconciliation: ["read", "execute"],
+    compliance_report: ["read"],
+    developer: ["read", "create", "update"],
+    transfer: ["read", "review", "approve", "execute", "update"],
   },
   operator: {
     user: ["read", "update"],
@@ -80,6 +86,9 @@ const rolePolicies: Record<Role, Record<ResourceKind, Action[]>> = {
     anchor: ["read", "execute"],
     ledger: ["read"],
     reconciliation: ["read", "execute"],
+    compliance_report: ["read"],
+    developer: ["read"],
+    transfer: ["read"],
   },
   issuer: {
     user: [],
@@ -94,7 +103,7 @@ const rolePolicies: Record<Role, Record<ResourceKind, Action[]>> = {
     offering: ["create", "read", "update", "submit"],
     investor_profile: [],
     subscription: ["read"],
-    distribution: ["create", "read", "update", "submit"],
+    distribution: ["create", "read", "update", "approve", "submit"],
     milestone: ["create", "read", "update", "submit"],
     tranche: ["read"],
     dispute: ["create", "read"],
@@ -103,6 +112,9 @@ const rolePolicies: Record<Role, Record<ResourceKind, Action[]>> = {
     anchor: ["read"],
     ledger: ["read"],
     reconciliation: [],
+    compliance_report: [],
+    developer: ["read", "create", "update"],
+    transfer: ["read"],
   },
   investor: {
     user: [],
@@ -126,6 +138,9 @@ const rolePolicies: Record<Role, Record<ResourceKind, Action[]>> = {
     anchor: ["read"],
     ledger: ["read"],
     reconciliation: [],
+    compliance_report: [],
+    developer: [],
+    transfer: ["create", "read", "update"],
   },
   professional: {
     user: [],
@@ -149,6 +164,9 @@ const rolePolicies: Record<Role, Record<ResourceKind, Action[]>> = {
     anchor: [],
     ledger: [],
     reconciliation: [],
+    compliance_report: [],
+    developer: [],
+    transfer: [],
   },
 };
 

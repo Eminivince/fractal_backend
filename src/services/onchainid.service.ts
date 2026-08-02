@@ -15,9 +15,11 @@ import {
   http,
   type Hash,
   encodeAbiParameters,
+  encodePacked,
   keccak256,
+  nonceManager,
 } from "viem";
-import { polygon, polygonAmoy } from "viem/chains";
+import { polygon, polygonAmoy, sepolia } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
 import { env } from "../config/env.js";
 import { registerWallet } from "./blockchain.service.js";
@@ -33,17 +35,42 @@ const CLAIM_ISSUER_ABI = [
       { name: "wallet", type: "address" },
       { name: "claimData", type: "bytes" },
       { name: "signature", type: "bytes" },
+      { name: "expiryTimestamp", type: "uint256" },
     ],
     outputs: [],
   },
 ] as const;
 
+const IDENTITY_FACTORY_ABI = [
+  {
+    name: "deployIdentity",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [{ name: "wallet", type: "address" }],
+    outputs: [{ name: "identityAddress", type: "address" }],
+  },
+  {
+    name: "identityOf",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "wallet", type: "address" }],
+    outputs: [{ name: "", type: "address" }],
+  },
+] as const;
+
+// KYC claim validity window (matches operator policy; on-chain claim expiry).
+const KYC_CLAIM_VALIDITY_SECONDS = 365 * 24 * 60 * 60;
+
 function getChain() {
-  return env.CHAIN_ID === 137 ? polygon : polygonAmoy;
+  if (env.CHAIN_ID === 137) return polygon;
+  if (env.CHAIN_ID === 11155111) return sepolia;
+  return polygonAmoy;
 }
 
 function getRpcUrl() {
-  return env.CHAIN_ID === 137 ? env.POLYGON_RPC_URL : env.POLYGON_AMOY_RPC_URL;
+  if (env.CHAIN_ID === 137) return env.POLYGON_RPC_URL;
+  if (env.CHAIN_ID === 11155111) return env.SEPOLIA_RPC_URL;
+  return env.POLYGON_AMOY_RPC_URL;
 }
 
 /**
@@ -67,20 +94,23 @@ function encodeKycClaimData(
 }
 
 /**
- * Sign KYC claim data with the Fractal agent key.
- * Signature = sign(keccak256(abi.encodePacked(wallet, KYC_TOPIC, claimData)))
+ * Sign KYC claim data with the Fractal agent (claim signing) key.
+ * MUST match ClaimIssuer.issueKycClaim:
+ *   keccak256(abi.encodePacked(wallet, KYC_TOPIC, claimData, expiryTimestamp))
+ * Note: abi.encodePacked (tight packing), NOT abi.encode.
  */
 async function signKycClaim(
   walletAddress: `0x${string}`,
   claimData: `0x${string}`,
+  expiryTimestamp: bigint,
 ): Promise<`0x${string}`> {
   const privateKey = await keyManager.getPrivateKey("fractal_agent");
 
   const KYC_TOPIC = 1n;
   const msgHash = keccak256(
-    encodeAbiParameters(
-      [{ type: "address" }, { type: "uint256" }, { type: "bytes" }],
-      [walletAddress, KYC_TOPIC, claimData],
+    encodePacked(
+      ["address", "uint256", "bytes", "uint256"],
+      [walletAddress, KYC_TOPIC, claimData, expiryTimestamp],
     ),
   );
 
@@ -108,10 +138,12 @@ export async function issueKycClaim(params: {
     params.countryCode,
     params.approvedAt,
   );
-  const signature = await signKycClaim(params.walletAddress, claimData);
+  const expiryTimestamp = BigInt(params.approvedAt + KYC_CLAIM_VALIDITY_SECONDS);
+  const signature = await signKycClaim(params.walletAddress, claimData, expiryTimestamp);
 
   const privateKey = await keyManager.getPrivateKey("fractal_agent");
-  const account = privateKeyToAccount(privateKey);
+  // Shared nonce manager prevents nonce collisions with other operator-wallet ops.
+  const account = privateKeyToAccount(privateKey, { nonceManager });
   const walletClient = createWalletClient({
     account,
     chain: getChain(),
@@ -127,6 +159,7 @@ export async function issueKycClaim(params: {
       params.walletAddress,
       claimData,
       signature,
+      expiryTimestamp,
     ],
     account,
     chain: getChain(),
@@ -137,32 +170,55 @@ export async function issueKycClaim(params: {
 
 /**
  * Deploy an Identity.sol contract for a new investor wallet.
- * NOTE: In production, use a dedicated IdentityFactory to avoid deploying
- * the full bytecode repeatedly. The Identity bytecode is managed off-chain here.
  *
- * For now this function is a placeholder that returns a mock address in dev
- * and would be replaced with actual deployment logic using the compiled artifact.
+ * IdentityFactory deploys an identity, authorizes the ClaimIssuer, and transfers
+ * ownership to the investor wallet atomically. There is no mock fallback.
  */
 export async function deployIdentityContract(
   walletAddress: `0x${string}`,
 ): Promise<{ identityContractAddress: `0x${string}`; deployTxHash: Hash }> {
-  // In production: load Identity.sol bytecode from artifacts and deploy
-  // For now, return a deterministic mock address based on wallet (dev only)
-  if (!env.PRIVY_ENABLED) {
-    const mockIdentity = `0x${keccak256(walletAddress).slice(
-      26,
-    )}` as `0x${string}`;
-    return {
-      identityContractAddress: mockIdentity,
-      deployTxHash: `0x${"0".repeat(64)}` as Hash,
-    };
+  if (!env.IDENTITY_FACTORY_ADDRESS) {
+    throw new Error("IDENTITY_FACTORY_ADDRESS not configured");
   }
 
-  // Production: deploy Identity.sol bytecode
-  // This would use: walletClient.deployContract({ abi: IDENTITY_ABI, bytecode: IDENTITY_BYTECODE, args: [walletAddress] })
-  throw new Error(
-    "Production Identity deployment requires compiled bytecode. Run: pnpm compile in packages/contracts/",
-  );
+  const privateKey = await keyManager.getPrivateKey("fractal_agent");
+  const account = privateKeyToAccount(privateKey, { nonceManager });
+  const chain = getChain();
+  const publicClient = createPublicClient({
+    chain,
+    transport: http(getRpcUrl()),
+  });
+  const walletClient = createWalletClient({
+    account,
+    chain,
+    transport: http(getRpcUrl()),
+  });
+
+  const deployTxHash = await walletClient.writeContract({
+    address: env.IDENTITY_FACTORY_ADDRESS as `0x${string}`,
+    abi: IDENTITY_FACTORY_ABI,
+    functionName: "deployIdentity",
+    args: [walletAddress],
+    account,
+    chain,
+  });
+
+  await publicClient.waitForTransactionReceipt({
+    hash: deployTxHash,
+    confirmations: env.BLOCKCHAIN_CONFIRMATIONS,
+  });
+
+  const identityContractAddress = await publicClient.readContract({
+    address: env.IDENTITY_FACTORY_ADDRESS as `0x${string}`,
+    abi: IDENTITY_FACTORY_ABI,
+    functionName: "identityOf",
+    args: [walletAddress],
+  });
+  if (identityContractAddress === "0x0000000000000000000000000000000000000000") {
+    throw new Error("IdentityFactory deployment confirmed without an identity address");
+  }
+
+  return { identityContractAddress, deployTxHash };
 }
 
 /**

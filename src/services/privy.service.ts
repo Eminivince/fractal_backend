@@ -46,9 +46,9 @@ export async function createEmbeddedWallet(privyUserId: string): Promise<{
   address: string;
 }> {
   if (!env.PRIVY_ENABLED) {
-    // Return a mock address for development
-    const mockAddress = `0x${"0".repeat(38)}${privyUserId.slice(-2)}` as `0x${string}`;
-    return { walletId: `mock-${privyUserId}`, address: mockAddress };
+    throw new Error(
+      "Embedded wallet provisioning is disabled. Configure Privy for a real sandbox or provider environment; fake wallet addresses are not supported.",
+    );
   }
 
   const response = await fetch(`${PRIVY_API_BASE}/wallets`, {
@@ -76,7 +76,11 @@ export async function createEmbeddedWallet(privyUserId: string): Promise<{
  * Get all wallets for a Privy user.
  */
 export async function getUserWallets(privyUserId: string): Promise<PrivyWalletCreateResponse[]> {
-  if (!env.PRIVY_ENABLED) return [];
+  if (!env.PRIVY_ENABLED) {
+    throw new Error(
+      "Embedded wallet provisioning is disabled. Configure Privy for a real sandbox or provider environment.",
+    );
+  }
 
   const response = await fetch(`${PRIVY_API_BASE}/users/${privyUserId}/wallets`, {
     headers: getPrivyHeaders(),

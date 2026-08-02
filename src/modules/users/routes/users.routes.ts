@@ -12,7 +12,7 @@ import { authorize } from "../../../utils/rbac.js";
 import { appendEvent } from "../../../utils/audit.js";
 import { HttpError } from "../../../utils/errors.js";
 import { serialize } from "../../../utils/serialize.js";
-import { sendEmailWithFallback } from "../../../services/email.js";
+import { requestPasswordReset } from "../../auth/services/account-security.service.js";
 
 const createUserSchema = z.object({
   email: z.string().email(),
@@ -199,35 +199,55 @@ export async function userRoutes(app: FastifyInstance) {
       const params = z.object({ id: z.string() }).parse(request.params);
       const user = await UserModel.findById(params.id).lean();
       if (!user) throw new HttpError(404, "User not found");
+      if (typeof user.email !== "string" || user.email.trim().length === 0) {
+        throw new HttpError(422, "User has no email address on file");
+      }
 
-      const resetCode = Math.random().toString(36).slice(2, 10).toUpperCase();
-      const delivery =
-        typeof user.email === "string" && user.email.trim().length > 0
-          ? await sendEmailWithFallback({
-              to: user.email,
-              subject: "Fractal account access reset request",
-              text: `A reset request was created for your account. Verification code: ${resetCode}`,
-              html: `<p>A reset request was created for your account.</p><p><strong>Verification code:</strong> ${resetCode}</p>`,
-            })
-          : {
-              status: "skipped" as const,
-              error: "User has no email",
-            };
+      // Use the real password-reset flow: generates a persisted, single-use,
+      // time-boxed token (hashed at rest) and emails a reset link.
+      await requestPasswordReset(user.email);
 
       await appendEvent(request.authUser, {
         entityType: "user",
         entityId: String(user._id),
         action: "Password reset requested",
-        notes:
-          delivery.status === "sent"
-            ? `email:${delivery.provider ?? "unknown"}`
-            : delivery.error,
+        notes: "Admin-initiated; reset link emailed to user.",
       });
 
-      return {
-        ok: true,
-        delivery: delivery.status,
-      };
+      return { ok: true };
+    },
+  );
+
+  // Per-user preferences (settings pages persist here).
+  app.get(
+    "/v1/users/me/preferences",
+    { preHandler: [app.authenticate] },
+    async (request: FastifyRequest) => {
+      const user = await UserModel.findById(request.authUser.userId).select("preferences").lean();
+      if (!user) throw new HttpError(404, "User not found");
+      return { preferences: user.preferences ?? {} };
+    },
+  );
+
+  app.put(
+    "/v1/users/me/preferences",
+    { preHandler: [app.authenticate] },
+    async (request: FastifyRequest) => {
+      const payload = z.object({ preferences: z.record(z.string(), z.any()) }).parse(request.body);
+      const user = await UserModel.findByIdAndUpdate(
+        request.authUser.userId,
+        { $set: { preferences: payload.preferences } },
+        { new: true },
+      )
+        .select("preferences")
+        .lean();
+      if (!user) throw new HttpError(404, "User not found");
+      await appendEvent(request.authUser, {
+        entityType: "user",
+        entityId: String(request.authUser.userId),
+        action: "PreferencesUpdated",
+      });
+      return { preferences: user.preferences ?? {} };
     },
   );
 }

@@ -7,6 +7,8 @@
 import type { FastifyBaseLogger } from "fastify";
 import { InvestorProfileModel } from "../db/models.js";
 import { createNotificationsFromEvent } from "../services/notifications.js";
+import { resetApplicant } from "../services/sumsub.js";
+import { env } from "../config/env.js";
 import type { AuthUser } from "../types.js";
 
 const SYSTEM_ACTOR: AuthUser = { userId: "system", role: "admin" };
@@ -31,8 +33,22 @@ export function startKycReverificationWorker(log: FastifyBaseLogger) {
       }).lean();
 
       for (const profile of expiredProfiles) {
+        // Actually trigger Sumsub re-verification: reset the applicant so the
+        // investor must re-submit KYC. Without this, status only flips locally.
+        if (env.SUMSUB_ENABLED && profile.sumsubApplicantId) {
+          try {
+            await resetApplicant(profile.sumsubApplicantId);
+          } catch (err) {
+            log.error(
+              { err, investorProfileId: String(profile._id) },
+              "[kyc-reverification] Sumsub applicant reset failed — flagging renewal anyway",
+            );
+          }
+        }
+
         await InvestorProfileModel.findByIdAndUpdate(profile._id, {
           kycStatus: "renewal_required",
+          sumsubReviewAnswer: null,
         });
 
         await createNotificationsFromEvent(SYSTEM_ACTOR, {

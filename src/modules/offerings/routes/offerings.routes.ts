@@ -19,6 +19,9 @@ import {
   UserModel,
 } from "../../../db/models.js";
 import { toDecimal } from "../../../utils/decimal.js";
+import { escrowAccountRef } from "../../../services/ledger.js";
+import { dispatchIssuerWebhook } from "../../../services/issuer-webhooks.js";
+import { isOnchainEnabled, autowireAllocationMint } from "../../../services/onchain-autowire.js";
 import { authorize } from "../../../utils/rbac.js";
 import { appendEvent } from "../../../utils/audit.js";
 import { HttpError } from "../../../utils/errors.js";
@@ -32,6 +35,21 @@ import { createAnchorRecord, hasAnchor } from "../../../utils/anchor.js";
 import { readCommandId, runIdempotentCommand } from "../../../utils/idempotency.js";
 import { persistOfferingImage, retrieveFile } from "../../../services/storage.js";
 import { createNotificationsFromEvent } from "../../../services/notifications.js";
+import { env } from "../../../config/env.js";
+import {
+  createPaystackTransferRecipient,
+  getAvailableBalanceKobo,
+  initiatePaystackTransfer,
+  nairaToKobo,
+} from "../../../services/paystack.js";
+import { OutboundTransferModel } from "../../../db/models.js";
+
+function toNumber(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "string") return Number(value);
+  if (value && typeof value === "object" && "toString" in value) return Number(value.toString());
+  return Number(value ?? 0);
+}
 
 const createOfferingSchema = z.object({
   applicationId: z.string(),
@@ -537,7 +555,7 @@ export async function offeringRoutes(app: FastifyInstance) {
       const params = z.object({ id: z.string() }).parse(request.params);
       const commandId = readCommandId(request.headers);
 
-      return runIdempotentCommand({
+      const result = await runIdempotentCommand({
         commandId,
         userId: request.authUser.userId,
         route: "POST:/v1/offerings/:id/approve-open",
@@ -674,6 +692,17 @@ export async function offeringRoutes(app: FastifyInstance) {
             return serialize(offering.toObject());
           }),
       });
+
+      // Post-commit: notify the issuer's registered webhooks (best-effort, signed).
+      if (result && (result as any).businessId) {
+        void dispatchIssuerWebhook({
+          type: "offering.opened",
+          businessId: String((result as any).businessId),
+          data: { offeringId: String((result as any).id ?? params.id), name: (result as any).name },
+        });
+      }
+
+      return result;
     },
   );
 
@@ -1213,6 +1242,29 @@ export async function offeringRoutes(app: FastifyInstance) {
               },
               session,
             );
+
+            // On-chain auto-wiring: enqueue token mints for allocated investors.
+            // Gated — a no-op unless the worker is enabled and the offering's token
+            // is deployed (so we never enqueue an op that would just dead-letter).
+            if (isOnchainEnabled()) {
+              const profiles = await InvestorProfileModel.find({
+                userId: { $in: paidSubscriptions.map((s: any) => s.investorUserId) },
+              })
+                .select("userId walletAddress")
+                .session(session)
+                .lean();
+              const walletByUser = new Map<string, string | undefined>(
+                profiles.map((p: any) => [String(p.userId), p.walletAddress]),
+              );
+              await autowireAllocationMint({
+                offering: offering as any,
+                entries: paidSubscriptions.map((s: any) => ({
+                  subscriptionId: String(s._id),
+                  walletAddress: walletByUser.get(String(s.investorUserId)),
+                  amount: Number(s.amount.toString()),
+                })),
+              });
+            }
 
             return {
               offeringId: String(offering._id),
@@ -1754,10 +1806,16 @@ export async function offeringRoutes(app: FastifyInstance) {
       const payload = z
         .object({
           amount: z.number().positive(),
-          externalRef: z.string().min(3),
+          externalRef: z.string().min(3).optional(),
           notes: z.string().optional(),
         })
         .parse(request.body);
+
+      // Manual mode requires externalRef; Paystack mode auto-generates it
+      if (!env.PAYSTACK_ENABLED && !payload.externalRef) {
+        throw new HttpError(422, "externalRef is required when Paystack is not enabled (manual payout mode)");
+      }
+
       const commandId = readCommandId(request.headers);
 
       return runIdempotentCommand({
@@ -1770,8 +1828,13 @@ export async function offeringRoutes(app: FastifyInstance) {
             const offering = await OfferingModel.findById(params.id).session(session);
             if (!offering) throw new HttpError(404, "Offering not found");
 
-            if (offering.status !== "servicing") {
-              throw new HttpError(422, "Offering must be in servicing status to disburse funds");
+            // Auto-transition: closed → servicing on first disbursement
+            if (offering.status === "closed") {
+              assertTransition("offering", offering.status as any, "servicing", {});
+              offering.status = "servicing";
+              await offering.save({ session });
+            } else if (offering.status !== "servicing") {
+              throw new HttpError(422, `Offering must be in "closed" or "servicing" status to disburse funds. Current: "${offering.status}"`);
             }
 
             const business = await BusinessModel.findById(offering.businessId).session(session);
@@ -1781,44 +1844,224 @@ export async function offeringRoutes(app: FastifyInstance) {
             if (!payoutAccount?.accountNumber) {
               throw new HttpError(422, "Issuer has not registered a payout bank account");
             }
+            const currency = payoutAccount.currency ?? "NGN";
 
-            const disburseIdempotencyKey = commandId ?? `disburse:${String(offering._id)}:${payload.externalRef}:${Date.now()}`;
+            // --- Fee deduction from feeSnapshot (frozen at offering creation) ---
+            const feeSnapshot = (offering as any).feeSnapshot ?? {};
+            const grossAmount = payload.amount;
+            const platformFeePct = toNumber(feeSnapshot.platformFeePct);
+            const platformFee = Math.round((grossAmount * platformFeePct) / 100 * 100) / 100;
 
-            // Debit escrow (money leaving the offering escrow)
+            // Setup fee is one-time: only charge if no prior disbursement exists
+            let setupFee = 0;
+            const priorDisbursement = await LedgerEntryModel.findOne({
+              accountRef: `platform:fees`,
+              entityType: "offering",
+              entityId: String(offering._id),
+              "metadata.feeType": "setup_fee",
+            }).session(session).lean();
+            if (!priorDisbursement) {
+              setupFee = toNumber(feeSnapshot.setupFee);
+            }
+
+            const totalFees = platformFee + setupFee;
+            const netAmount = grossAmount - totalFees;
+            if (netAmount <= 0) {
+              throw new HttpError(422, `Net amount after fees (${netAmount}) must be positive. Gross: ${grossAmount}, platformFee: ${platformFee}, setupFee: ${setupFee}`);
+            }
+
+            // --- Paystack-enabled path: automated bank transfer ---
+            if (env.PAYSTACK_ENABLED) {
+              if (!payoutAccount.bankCode) {
+                throw new HttpError(422, "Business payout bank account is incomplete — bankCode required for Paystack transfer");
+              }
+
+              const netAmountKobo = nairaToKobo(netAmount);
+              if (netAmountKobo <= 0) {
+                throw new HttpError(422, "Net transfer amount must be positive after fee deduction");
+              }
+
+              // Pre-flight balance check
+              if (env.PAYSTACK_BALANCE_CHECK_ENABLED) {
+                const availableKobo = await getAvailableBalanceKobo();
+                if (availableKobo < netAmountKobo) {
+                  throw new HttpError(
+                    422,
+                    `Insufficient Paystack balance: available ${availableKobo / 100} NGN, required ${netAmountKobo / 100} NGN`,
+                  );
+                }
+              }
+
+              // Ensure business has a Paystack transfer recipient
+              let recipientCode = payoutAccount.recipientCode;
+              if (!recipientCode) {
+                const recipient = await createPaystackTransferRecipient({
+                  name: payoutAccount.accountName || (business as any).name,
+                  accountNumber: payoutAccount.accountNumber,
+                  bankCode: payoutAccount.bankCode,
+                });
+                recipientCode = recipient.recipient_code;
+                await BusinessModel.updateOne(
+                  { _id: business._id },
+                  { $set: { "payoutBankAccount.recipientCode": recipientCode } },
+                ).session(session);
+              }
+
+              const transferRef = `fund-release-${String(offering._id)}-${Date.now()}`;
+              const transfer = await initiatePaystackTransfer({
+                recipientCode,
+                amountKobo: netAmountKobo,
+                reference: transferRef,
+                reason: `Fund release for offering ${(offering as any).name ?? String(offering._id)}`,
+              });
+
+              // Create OutboundTransfer record — status managed by webhook
+              await OutboundTransferModel.create(
+                [
+                  {
+                    transferCode: transfer.transfer_code,
+                    reference: transferRef,
+                    recipientCode,
+                    amountKobo: netAmountKobo,
+                    currency,
+                    reason: `Fund release for offering ${String(offering._id)}`,
+                    status: "pending",
+                    entityType: "fund_release",
+                    entityId: String(offering._id),
+                    paystackStatus: transfer.status,
+                    metadata: {
+                      grossAmount,
+                      platformFee,
+                      setupFee,
+                      netAmount,
+                      notes: payload.notes,
+                    },
+                  },
+                ],
+                { session },
+              );
+
+              // Fee ledger entries (posted immediately — fees are earned on disbursement)
+              if (platformFee > 0) {
+                await LedgerEntryModel.create(
+                  [
+                    {
+                      ledgerType: "fee",
+                      accountRef: "platform:fees",
+                      direction: "credit",
+                      amount: toDecimal(platformFee),
+                      currency,
+                      entityType: "offering",
+                      entityId: String(offering._id),
+                      externalRef: transferRef,
+                      idempotencyKey: `${commandId ?? transferRef}:platform-fee`,
+                      postedAt: new Date(),
+                      metadata: { feeType: "platform_fee", pct: platformFeePct, grossAmount },
+                    },
+                  ],
+                  { session },
+                );
+              }
+
+              if (setupFee > 0) {
+                await LedgerEntryModel.create(
+                  [
+                    {
+                      ledgerType: "fee",
+                      accountRef: "platform:fees",
+                      direction: "credit",
+                      amount: toDecimal(setupFee),
+                      currency,
+                      entityType: "offering",
+                      entityId: String(offering._id),
+                      externalRef: transferRef,
+                      idempotencyKey: `${commandId ?? transferRef}:setup-fee`,
+                      postedAt: new Date(),
+                      metadata: { feeType: "setup_fee" },
+                    },
+                  ],
+                  { session },
+                );
+              }
+
+              await appendEvent(
+                request.authUser,
+                {
+                  entityType: "offering",
+                  entityId: String(offering._id),
+                  action: "FundReleaseInitiated",
+                  notes: `Paystack transfer initiated: ${transfer.transfer_code} | gross:${grossAmount} fees:${totalFees} net:${netAmount}`,
+                },
+                session,
+              );
+
+              await createNotificationsFromEvent(
+                request.authUser,
+                {
+                  entityType: "offering",
+                  entityId: String(offering._id),
+                  action: "FundReleaseInitiated",
+                  notes: `offeringName:${(offering as any).name} amount:${netAmount}`,
+                },
+                session,
+              );
+
+              return {
+                mode: "paystack",
+                offeringId: String(offering._id),
+                businessId: String(offering.businessId),
+                grossAmount,
+                platformFee,
+                setupFee,
+                netAmount,
+                transferReference: transferRef,
+                transferCode: transfer.transfer_code,
+                status: "pending",
+                payoutAccount: {
+                  bankName: payoutAccount.bankName,
+                  accountNumber: payoutAccount.accountNumber,
+                  accountName: payoutAccount.accountName,
+                  currency,
+                },
+              };
+            }
+
+            // --- Manual mode (Paystack disabled): immediate ledger entries with externalRef ---
+            const externalRef = payload.externalRef!;
+            const disburseIdempotencyKey = commandId ?? `disburse:${String(offering._id)}:${externalRef}:${Date.now()}`;
+
+            // Debit escrow (gross amount leaving escrow)
             await LedgerEntryModel.create(
               [
                 {
                   ledgerType: "tranche",
-                  accountRef: `escrow:offering:${String(offering._id)}`,
+                  accountRef: escrowAccountRef(offering._id),
                   direction: "debit",
-                  amount: toDecimal(payload.amount),
-                  currency: payoutAccount.currency ?? "NGN",
+                  amount: toDecimal(grossAmount),
+                  currency,
                   entityType: "offering",
                   entityId: String(offering._id),
-                  externalRef: payload.externalRef,
+                  externalRef,
                   idempotencyKey: `${disburseIdempotencyKey}:debit`,
                   postedAt: new Date(),
-                  metadata: {
-                    disbursementType: "issuer_payout",
-                    notes: payload.notes,
-                  },
+                  metadata: { disbursementType: "issuer_payout", notes: payload.notes },
                 },
               ],
               { session },
             );
 
-            // Credit issuer (money arriving at issuer business account)
+            // Credit issuer (net amount after fees)
             await LedgerEntryModel.create(
               [
                 {
                   ledgerType: "tranche",
                   accountRef: `issuer:business:${String(offering.businessId)}`,
                   direction: "credit",
-                  amount: toDecimal(payload.amount),
-                  currency: payoutAccount.currency ?? "NGN",
+                  amount: toDecimal(netAmount),
+                  currency,
                   entityType: "offering",
                   entityId: String(offering._id),
-                  externalRef: payload.externalRef,
+                  externalRef,
                   idempotencyKey: `${disburseIdempotencyKey}:credit`,
                   postedAt: new Date(),
                   metadata: {
@@ -1833,27 +2076,85 @@ export async function offeringRoutes(app: FastifyInstance) {
               { session },
             );
 
+            // Fee ledger entries
+            if (platformFee > 0) {
+              await LedgerEntryModel.create(
+                [
+                  {
+                    ledgerType: "fee",
+                    accountRef: "platform:fees",
+                    direction: "credit",
+                    amount: toDecimal(platformFee),
+                    currency,
+                    entityType: "offering",
+                    entityId: String(offering._id),
+                    externalRef,
+                    idempotencyKey: `${disburseIdempotencyKey}:platform-fee`,
+                    postedAt: new Date(),
+                    metadata: { feeType: "platform_fee", pct: platformFeePct, grossAmount },
+                  },
+                ],
+                { session },
+              );
+            }
+
+            if (setupFee > 0) {
+              await LedgerEntryModel.create(
+                [
+                  {
+                    ledgerType: "fee",
+                    accountRef: "platform:fees",
+                    direction: "credit",
+                    amount: toDecimal(setupFee),
+                    currency,
+                    entityType: "offering",
+                    entityId: String(offering._id),
+                    externalRef,
+                    idempotencyKey: `${disburseIdempotencyKey}:setup-fee`,
+                    postedAt: new Date(),
+                    metadata: { feeType: "setup_fee" },
+                  },
+                ],
+                { session },
+              );
+            }
+
             await appendEvent(
               request.authUser,
               {
                 entityType: "offering",
                 entityId: String(offering._id),
                 action: "IssuerDisbursed",
-                notes: `ref:${payload.externalRef} amount:${payload.amount}`,
+                notes: `ref:${externalRef} gross:${grossAmount} fees:${totalFees} net:${netAmount}`,
+              },
+              session,
+            );
+
+            await createNotificationsFromEvent(
+              request.authUser,
+              {
+                entityType: "offering",
+                entityId: String(offering._id),
+                action: "IssuerDisbursed",
+                notes: `offeringName:${(offering as any).name} amount:${netAmount}`,
               },
               session,
             );
 
             return {
+              mode: "manual",
               offeringId: String(offering._id),
               businessId: String(offering.businessId),
-              amount: payload.amount,
-              externalRef: payload.externalRef,
+              grossAmount,
+              platformFee,
+              setupFee,
+              netAmount,
+              externalRef,
               payoutAccount: {
                 bankName: payoutAccount.bankName,
                 accountNumber: payoutAccount.accountNumber,
                 accountName: payoutAccount.accountName,
-                currency: payoutAccount.currency ?? "NGN",
+                currency,
               },
             };
           }),
@@ -1879,12 +2180,12 @@ export async function offeringRoutes(app: FastifyInstance) {
       const [credits, debits, pendingDistributions] = await Promise.all([
         LedgerEntryModel.find({
           ledgerType: { $in: ["escrow", "subscription"] },
-          accountRef: `escrow:offering:${String(offering._id)}`,
+          accountRef: escrowAccountRef(offering._id),
           direction: "credit",
         }).lean(),
         LedgerEntryModel.find({
           ledgerType: { $in: ["escrow", "subscription", "distribution", "tranche"] },
-          accountRef: `escrow:offering:${String(offering._id)}`,
+          accountRef: escrowAccountRef(offering._id),
           direction: "debit",
         }).lean(),
         DistributionModel.find({
@@ -1936,7 +2237,7 @@ export async function offeringRoutes(app: FastifyInstance) {
       }
 
       const entries = await LedgerEntryModel.find({
-        ledgerType: "tranche",
+        ledgerType: { $in: ["tranche", "fee"] },
         accountRef: `issuer:business:${String(offering.businessId)}`,
         entityType: "offering",
         entityId: String(offering._id),
@@ -2043,6 +2344,13 @@ export async function offeringRoutes(app: FastifyInstance) {
 
       const offering = await OfferingModel.findById(params.id).lean();
       if (!offering) throw new HttpError(404, "Offering not found");
+
+      // Data-leak gate: this is an UNAUTHENTICATED endpoint, so only serve images
+      // for offerings that are publicly visible (not draft/in-review/etc.).
+      const PUBLIC_OFFERING_STATUSES = ["open", "paused", "closed", "servicing", "exited"];
+      if (!PUBLIC_OFFERING_STATUSES.includes(offering.status)) {
+        throw new HttpError(404, "Offering not found");
+      }
 
       const images = Array.isArray(offering.images) ? offering.images : [];
       const img = images.find((item: any) => String(item._id) === params.imageId);
@@ -2708,6 +3016,13 @@ export async function offeringRoutes(app: FastifyInstance) {
 
       const offering = await OfferingModel.findById(params.id).lean();
       if (!offering) throw new HttpError(404, "Offering not found");
+
+      // Data-leak gate: unauthenticated endpoint — only expose updates for
+      // publicly visible offerings (not draft/in-review/etc.).
+      const PUBLIC_OFFERING_STATUSES = ["open", "paused", "closed", "servicing", "exited"];
+      if (!PUBLIC_OFFERING_STATUSES.includes(offering.status)) {
+        throw new HttpError(404, "Offering not found");
+      }
 
       const skip = (query.page - 1) * query.limit;
       const [updates, total] = await Promise.all([

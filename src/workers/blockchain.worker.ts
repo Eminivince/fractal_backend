@@ -19,6 +19,7 @@ import {
   executePayout,
   whitelistInvestor,
   setInvestorTier,
+  getDeployedToken,
   waitForTransaction,
   type BatchMintEntry,
   type BatchLockEntry,
@@ -65,6 +66,7 @@ async function executeOp(op: { _id: unknown; opType: string; entityType: string;
         tokenSymbol: (op.payload.tokenSymbol as string) ?? `FRAC-${offering._id.toString().slice(-4).toUpperCase()}`,
         maxBalancePerHolder: op.payload.maxBalancePerHolder as number | undefined,
         retailCap: op.payload.retailCap as number | undefined,
+        maxTotalSupply: op.payload.maxTotalSupply as number,
       });
 
       await OfferingModel.findByIdAndUpdate(op.entityId, {
@@ -220,8 +222,10 @@ async function handlePostConfirmation(
 
   switch (op.opType) {
     case "deploy_token": {
+      const deployment = await getDeployedToken(op.entityId);
       await OfferingModel.findByIdAndUpdate(op.entityId, {
         "tokenDeployment.status": "deployed",
+        "tokenDeployment.contractAddress": deployment.tokenContract,
         "tokenDeployment.deployedAt": now,
         "tokenDeployment.deployTxHash": txHash,
       });

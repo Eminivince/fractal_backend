@@ -124,6 +124,10 @@ const platformConfigSchema = new Schema(
         weight: { type: Number, default: 1 },
       },
     ],
+    // B10: Per-tenant rate limit overrides
+    rateLimitOverrides: {
+      byBusiness: { type: Schema.Types.Mixed, default: {} },
+    },
     updatedBy: { type: Schema.Types.ObjectId, ref: "User" },
     updatedAt: { type: Date, default: Date.now },
   },

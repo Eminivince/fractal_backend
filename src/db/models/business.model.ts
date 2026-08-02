@@ -24,7 +24,7 @@ const businessSchema = new Schema(
     },
     kybStatus: {
       type: String,
-      enum: ["draft", "submitted", "in_review", "approved", "rejected"],
+      enum: ["draft", "submitted", "in_review", "approved", "rejected", "needs_renewal"],
       default: "draft",
       index: true,
     },
@@ -122,6 +122,8 @@ const businessSchema = new Schema(
       accountNumber: { type: String, trim: true, maxlength: 500 },
       accountName: { type: String, trim: true, maxlength: 200 },
       routingCode: { type: String, trim: true, maxlength: 500 },
+      bankCode: { type: String, trim: true, maxlength: 20 },
+      recipientCode: { type: String, trim: true, maxlength: 200 },
       currency: { type: String, trim: true, default: "NGN", maxlength: 500 },
       updatedAt: { type: Date },
     },

@@ -23,7 +23,7 @@ export function startNotificationWorker(log: LoggerLike): NotificationWorkerHand
   }
 
   if (!hasAnyEmailTransportConfigured()) {
-    log.warn("Notification email worker inactive: no SendGrid or SMTP transport configured");
+    log.warn("Notification email worker inactive: no Resend or SMTP transport configured");
     return {
       stop: () => undefined,
       triggerNow: async () => undefined,

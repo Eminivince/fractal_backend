@@ -31,9 +31,24 @@ const userSchema = new Schema(
     investorProfileId: { type: Schema.Types.ObjectId, ref: "InvestorProfile" },
     status: { type: String, enum: ["active", "disabled"], default: "active" },
     passwordHash: { type: String, required: false },
-    passwordResetToken: { type: String },
+    passwordResetToken: { type: String, index: true },
     passwordResetExpires: { type: Date },
+    // Email verification
+    emailVerified: { type: Boolean, default: false },
+    emailVerifyToken: { type: String, index: true },
+    emailVerifyExpires: { type: Date },
     tokenInvalidatedAt: { type: Date },
+    // Per-user UI/notification preferences (free-form, persisted from settings pages).
+    preferences: { type: Schema.Types.Mixed, default: {} },
+    // C12: GDPR consent tracking
+    consents: [
+      {
+        type: { type: String, required: true },
+        grantedAt: { type: Date, required: true },
+        revokedAt: { type: Date },
+        ipAddress: { type: String },
+      },
+    ],
   },
   { ...timestamped, collection: "users" },
 );

@@ -43,7 +43,7 @@ const distributionLineSchema = new Schema(
     currency: { type: String, default: "NGN" },
     status: {
       type: String,
-      enum: ["pending", "paid", "failed", "skipped"],
+      enum: ["pending", "processing", "paid", "failed", "skipped", "reversed"],
       default: "pending",
       index: true,
     },
@@ -51,6 +51,9 @@ const distributionLineSchema = new Schema(
     paymentRef: { type: String, trim: true },
     paidAt: { type: Date },
     failureReason: { type: String, trim: true },
+    // 3.4: number of retry attempts — used to derive a deterministic, per-attempt
+    // transfer reference so Paystack's duplicate-reference protection still applies.
+    retryCount: { type: Number, default: 0 },
   },
   { ...timestamped, collection: "distribution_lines" },
 );

@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { env } from "../config/env.js";
 
 function isTransactionUnsupported(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -31,8 +32,17 @@ export async function runInTransaction<T>(fn: (session: mongoose.ClientSession) 
       if (result !== undefined) return result;
     } catch (error) {
       if (!isTransactionUnsupported(error)) throw error;
+      // In production, atomicity is a hard requirement for financial writes.
+      // Degrading to a non-transactional path silently loses the all-or-nothing
+      // guarantee, so fail loudly instead — the deployment MUST use a replica set.
+      if (env.NODE_ENV === "production") {
+        throw new Error(
+          "[tx] MongoDB transactions are unavailable but NODE_ENV=production. " +
+            "A replica-set (or mongos) connection is required for atomic financial writes.",
+        );
+      }
       console.warn(
-        "[tx] MongoDB transactions are unavailable; executing operation without transaction session.",
+        "[tx] MongoDB transactions are unavailable; executing operation without transaction session (non-production only).",
       );
       return fn(null as unknown as mongoose.ClientSession);
     }
