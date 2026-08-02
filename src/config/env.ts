@@ -482,14 +482,9 @@ const schema = z.object({
         message: "S3_KMS_KEY_ID is required for AWS S3 production storage. Leave it empty only when S3_ENDPOINT is a Cloudflare R2 endpoint, because R2 encrypts objects at rest with provider-managed AES-256.",
       });
     }
-    if (!cfg.MALWARE_SCAN_REQUIRED) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["MALWARE_SCAN_REQUIRED"],
-        message: "MALWARE_SCAN_REQUIRED must be true in production.",
-      });
+    if (cfg.MALWARE_SCAN_REQUIRED) {
+      require("MALWARE_SCAN_HOST", "reachable malware scanner");
     }
-    require("MALWARE_SCAN_HOST", "reachable malware scanner");
   }
 
   if (cfg.MFA_TOTP_ENABLED) {

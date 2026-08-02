@@ -67,6 +67,28 @@ describe("environment validation", () => {
     expect(module.env.S3_KMS_KEY_ID).toBeUndefined();
   });
 
+  it("accepts the temporary production launch exception with malware scanning disabled", async () => {
+    const module = await loadEnv(productionBaseEnv({
+      S3_ENDPOINT: "https://account-id.r2.cloudflarestorage.com",
+      S3_FORCE_PATH_STYLE: "true",
+      S3_KMS_KEY_ID: undefined,
+      MALWARE_SCAN_REQUIRED: "false",
+      MALWARE_SCAN_HOST: undefined,
+    }));
+    expect(module.env.MALWARE_SCAN_REQUIRED).toBe(false);
+    expect(module.env.MALWARE_SCAN_HOST).toBeUndefined();
+  });
+
+  it("requires a malware scanner host when production malware scanning is enabled", async () => {
+    await expect(loadEnv(productionBaseEnv({
+      S3_ENDPOINT: "https://account-id.r2.cloudflarestorage.com",
+      S3_FORCE_PATH_STYLE: "true",
+      S3_KMS_KEY_ID: undefined,
+      MALWARE_SCAN_REQUIRED: "true",
+      MALWARE_SCAN_HOST: undefined,
+    }))).rejects.toThrow("Invalid environment configuration");
+  });
+
   it("requires an AWS KMS key ID for production AWS S3 storage", async () => {
     await expect(loadEnv(productionBaseEnv({
       S3_ENDPOINT: undefined,
